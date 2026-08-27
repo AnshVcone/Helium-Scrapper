@@ -1,0 +1,27 @@
+# Secrets -- never commit. .env holds the Helium 10 password and the staging DB
+# password. The negation for .env.example keeps the (blank) template tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
+# Browser profile: holds the live Helium 10 session cookies.
+profile/
+
+# Scraped output, job history and panel dumps -- data, not code, and probe
+# dumps contain full page text.
+output/
+
+# The vendored extension (13 MB, redownloadable with `npm run fetch-ext`).
+vendor/
+
+node_modules/
+
+# OS / editor noise
+.DS_Store
+*.log
+.idea/
+.vscode/

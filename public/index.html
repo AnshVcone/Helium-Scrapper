@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upload ASINs · Helium 10 panel scraper</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Helium 10 panel scraper</h1>
+    <nav>
+      <a href="/" aria-current="page">Upload</a>
+      <a href="/status.html">Status</a>
+    </nav>
+  </header>
+  <p class="sub">
+    <span id="health"><span class="dot off"></span>checking…</span>
+    &nbsp;·&nbsp; Found rows go to <code>helium_product_research</code>, misses to <code>helium_product_research_missing</code>.
+  </p>
+
+  <div class="card">
+    <h2>Upload a CSV of ASINs</h2>
+    <form id="form">
+      <div class="row">
+        <div>
+          <label for="file">CSV or text file</label>
+          <input type="file" id="file" name="file" accept=".csv,.txt,text/csv,text/plain" required>
+        </div>
+        <div style="flex:0 0 150px">
+          <label for="marketplace">Marketplace</label>
+          <select id="marketplace">
+            <option value="US" selected>US</option>
+            <option value="CA">CA</option>
+            <option value="UK">UK</option>
+            <option value="DE">DE</option>
+            <option value="IN">IN</option>
+          </select>
+        </div>
+        <div style="flex:0 0 auto">
+          <button type="submit" id="go">Start scrape</button>
+        </div>
+      </div>
+    </form>
+
+    <div class="note" id="preview" hidden></div>
+    <div class="note" id="result" hidden></div>
+
+    <p class="muted" style="font-size:12.5px;margin:16px 0 0">
+      Any column layout works. Anything that is 10 alphanumeric characters and contains a
+      digit is treated as an ASIN; headers and stray words are rejected and counted, never
+      passed through silently. Duplicates are removed within the file, and any ASIN already
+      scraped for today's date is skipped — so overlapping sheets, or a re-upload to finish
+      an interrupted run, only cost the outstanding work.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Recent jobs</h2>
+    <div class="scroll"><table id="recent">
+      <thead><tr>
+        <th>Job</th><th>File</th><th>State</th><th>Progress</th>
+        <th class="num">Found</th><th class="num">Missing</th><th class="num">Errors</th><th>Started</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="empty" id="noJobs">No jobs yet.</div>
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const fmt = (n) => Number(n ?? 0).toLocaleString();
+
+// Per-ASIN cost is measured, not assumed: 4-9s of page load plus panel read,
+// then 4-9s of pacing jitter. Showing the range up front stops someone
+// uploading 70k ASINs expecting it to finish over lunch.
+function estimate(n) {
+  const lo = (n * 7) / 3600, hi = (n * 11) / 3600;
+  const f = (h) => (h < 1 ? `${Math.round(h * 60)} min` : `${h.toFixed(1)} h`);
+  return `${f(lo)} – ${f(hi)}`;
+}
+
+async function health() {
+  try {
+    const r = await fetch('/health');
+    const d = await r.json();
+    $('#health').innerHTML = d.ok
+      ? `<span class="dot"></span>db <strong>${d.db}</strong>`
+      : `<span class="dot off"></span>db unreachable`;
+  } catch {
+    $('#health').innerHTML = '<span class="dot off"></span>server unreachable';
+  }
+}
+
+// Count the ASINs client-side before upload so the operator sees the size and
+// the time cost before committing to a run.
+$('#file').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  const box = $('#preview');
+  if (!f) { box.hidden = true; return; }
+  const text = await f.text();
+  const seen = new Set();
+  let rejected = 0;
+  for (const t of text.split(/[\s,;]+/)) {
+    const v = t.trim().replace(/^["']|["']$/g, '').toUpperCase();
+    if (!v) continue;
+    if (/^[A-Z0-9]{10}$/.test(v) && /\d/.test(v)) seen.add(v);
+    else rejected++;
+  }
+  box.hidden = false;
+  box.className = 'note' + (seen.size ? '' : ' bad');
+  box.innerHTML = seen.size
+    ? `<strong>${fmt(seen.size)}</strong> unique ASINs · ${fmt(rejected)} tokens ignored
+       · estimated run time <strong>${estimate(seen.size)}</strong>`
+    : `No valid ASINs found in <strong>${f.name}</strong>.`;
+});
+
+$('#form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = $('#file').files[0];
+  if (!f) return;
+
+  const btn = $('#go');
+  btn.disabled = true;
+  btn.textContent = 'Uploading…';
+
+  const body = new FormData();
+  body.append('file', f);
+
+  const box = $('#result');
+  box.hidden = false;
+  try {
+    const r = await fetch(`/jobs?marketplace=${encodeURIComponent($('#marketplace').value)}`, {
+      method: 'POST', body,
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      box.className = 'note bad';
+      box.innerHTML = `<strong>Rejected.</strong> ${d.error || 'Upload failed.'}`;
+    } else {
+      box.className = 'note ok';
+      box.innerHTML =
+        `<strong>Job started.</strong> ${fmt(d.accepted)} ASINs accepted` +
+        (d.rejectedTokens ? `, ${fmt(d.rejectedTokens)} tokens ignored` : '') +
+        `.<br><span class="mono">${d.jobId}</span><br>` +
+        `<a href="/status.html?job=${d.jobId}">Follow progress →</a>`;
+      load();
+    }
+  } catch (err) {
+    box.className = 'note bad';
+    box.innerHTML = `<strong>Upload failed.</strong> ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Start scrape';
+  }
+});
+
+async function load() {
+  try {
+    const d = await (await fetch('/jobs')).json();
+    const rows = d.jobs.slice(0, 8);
+    $('#noJobs').hidden = rows.length > 0;
+    $('#recent').tBodies[0].innerHTML = rows.map((j) => `
+      <tr>
+        <td><a class="mono" href="/status.html?job=${j.id}">${j.id.slice(0, 8)}</a></td>
+        <td>${j.filename ? j.filename.replace(/[<>&]/g, '') : '<span class="muted">—</span>'}</td>
+        <td><span class="pill ${j.state}">${j.state}</span></td>
+        <td><div class="bar" title="${j.processed}/${j.total}"><i style="width:${j.percent}%"></i></div></td>
+        <td class="num">${fmt(j.found)}</td>
+        <td class="num">${fmt(j.missing)}</td>
+        <td class="num">${fmt(j.errors)}</td>
+        <td class="muted">${j.startedAt ? new Date(j.startedAt).toLocaleString() : '—'}</td>
+      </tr>`).join('');
+  } catch { /* server may be restarting */ }
+}
+
+health();
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

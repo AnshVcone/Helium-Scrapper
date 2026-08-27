@@ -1,0 +1,24 @@
+{
+  "name": "helium10-panel-scraper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reads 30-day revenue / unit sales off the Helium 10 Chrome extension panel on Amazon product pages.",
+  "scripts": {
+    "fetch-ext": "node scripts/fetch-extension.mjs",
+    "auth": "node src/authcheck.js",
+    "dbcheck": "node src/dbcheck.js",
+    "probe": "node src/probe.js",
+    "scrape": "node src/scrape.js",
+    "serve": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "multer": "^2.2.0",
+    "pg": "^8.23.0",
+    "playwright": "^1.49.0"
+  },
+  "engines": {
+    "node": ">=20.12"
+  }
+}

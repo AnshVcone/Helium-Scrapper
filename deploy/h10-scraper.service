@@ -1,0 +1,41 @@
+[Unit]
+Description=Helium 10 panel scraper (upload form, status page, scrape worker)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
+# Deliberately NOT EnvironmentFile=.env -- systemd's parser differs from Node's
+# (quoting, `$`, multi-line), so a password systemd mis-parses would either stop
+# the service booting or load a different value than a local run. The app reads
+# .env itself, so there is one parser and one behaviour everywhere.
+Environment=NODE_ENV=production
+Environment=HEADLESS=1
+ExecStart=/usr/bin/node src/server.js
+
+# A crash mid-scrape is expected occasionally (Chromium dying, network blips).
+# Restarting is safe: interrupted jobs re-queue on boot and the ledger check
+# means the resumed run only pays for ASINs that had not settled.
+Restart=always
+RestartSec=10
+
+# Chromium is memory-hungry and long-lived here; give it room but keep a ceiling
+# so a leak takes out the service rather than the box.
+MemoryMax=3G
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=h10-scraper
+
+# The service only needs its own directory writable. Chromium's own sandbox
+# still works under this, so --no-sandbox is not required (unlike in a
+# root-running container).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=__APP_DIR__
+
+[Install]
+WantedBy=multi-user.target

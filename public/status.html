@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job status · Helium 10 panel scraper</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Job status</h1>
+    <nav>
+      <a href="/">Upload</a>
+      <a href="/status.html" aria-current="page">Status</a>
+    </nav>
+  </header>
+  <p class="sub" id="tick">Refreshing every 3s while a job is running.</p>
+
+  <div class="card" id="detail" hidden>
+    <h2>Selected job</h2>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px">
+      <span class="pill" id="dState">—</span>
+      <span class="mono muted" id="dId"></span>
+      <span class="muted" id="dFile"></span>
+      <span class="muted" id="dAttempt"></span>
+      <button class="ghost" id="stop" style="margin-left:auto" hidden>Stop job</button>
+    </div>
+
+    <div class="bar" style="height:9px"><i id="dBar" style="width:0%"></i></div>
+    <p class="muted" style="font-size:12.5px;margin:8px 0 18px" id="dProgress">—</p>
+
+    <div class="stats">
+      <div class="stat"><div class="n" id="sTotal">0</div><div class="k">ASINs in file</div></div>
+      <div class="stat"><div class="n" id="sSkipped">0</div><div class="k">Already done today</div></div>
+      <div class="stat found"><div class="n" id="sFound">0</div><div class="k">Data found</div></div>
+      <div class="stat missing"><div class="n" id="sMissing">0</div><div class="k">No data</div></div>
+      <div class="stat errors"><div class="n" id="sErrors">0</div><div class="k">Errors (will retry)</div></div>
+    </div>
+
+    <div class="note" id="dInserted" style="margin-top:18px"></div>
+    <div class="note" id="dBreakdown" hidden></div>
+    <div class="note warn" id="dRetry" hidden></div>
+    <div class="note warn" id="dAborted" hidden></div>
+    <div class="note bad" id="dError" hidden></div>
+  </div>
+
+  <div class="card">
+    <h2>All jobs</h2>
+    <div class="scroll"><table id="all">
+      <thead><tr>
+        <th>Job</th><th>File</th><th>State</th><th>Progress</th>
+        <th class="num">Total</th><th class="num">Found</th><th class="num">Missing</th>
+        <th class="num">Errors</th><th class="num">Inserted</th><th>Finished</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="empty" id="noJobs">No jobs yet. <a href="/">Upload a CSV →</a></div>
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const fmt = (n) => Number(n ?? 0).toLocaleString();
+let selected = new URLSearchParams(location.search).get('job');
+
+// Statuses that are facts about the product, versus ones that mean our own run
+// had a problem. Errors are never written to the missing table, so they are
+// shown separately -- a timeout must not read as "this product has no data".
+const LABEL = {
+  OK: 'data found',
+  NO_DATA: 'no estimate exists',
+  REDIRECTED: 'Amazon served another ASIN',
+  DEAD: 'ASIN does not exist',
+  TIMEOUT: 'panel never populated — the usual sign of throttling (retry)',
+  BLOCKED: 'Amazon bot wall',
+  SHAPE_UNKNOWN: 'panel markup unrecognised',
+  NOT_LOGGED_IN: 'session dropped',
+  DISCONNECTED: 'browser died',
+  EXTENSION_MISSING: 'extension not loaded',
+};
+
+function renderDetail(j) {
+  $('#detail').hidden = false;
+  $('#dState').textContent = j.state;
+  $('#dState').className = 'pill ' + j.state;
+  $('#dId').textContent = j.id;
+  $('#dFile').textContent = j.filename || '';
+  $('#dAttempt').innerHTML = '';
+  $('#dBar').style.width = j.percent + '%';
+  $('#dProgress').textContent =
+    `${fmt(j.processed)} scraped` +
+    (j.skipped ? `, ${fmt(j.skipped)} skipped as already done` : '') +
+    ` of ${fmt(j.total)} (${j.percent}%)` +
+    (j.current ? ` · currently ${j.current}` : '') +
+    (j.remaining && j.state === 'running' ? ` · ${fmt(j.remaining)} left` : '') +
+    ` · marketplace ${j.marketplace} · fetch_date ${j.fetchDate}`;
+
+  $('#sTotal').textContent = fmt(j.total);
+  $('#sSkipped').textContent = fmt(j.skipped);
+  $('#sFound').textContent = fmt(j.found);
+  $('#sMissing').textContent = fmt(j.missing);
+  $('#sErrors').textContent = fmt(j.errors);
+
+  $('#dInserted').innerHTML =
+    `Written to Postgres: <strong>${fmt(j.insertedFound)}</strong> into ` +
+    `<code>helium_product_research</code>, <strong>${fmt(j.insertedMissing)}</strong> into ` +
+    `<code>helium_product_research_missing</code>.` +
+    (j.rejectedTokens ? ` &nbsp;·&nbsp; ${fmt(j.rejectedTokens)} tokens in the file were not ASINs.` : '');
+
+  const entries = Object.entries(j.byStatus || {});
+  $('#dBreakdown').hidden = entries.length === 0;
+  if (entries.length) {
+    $('#dBreakdown').innerHTML = '<strong>Outcomes</strong><br>' + entries
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `<code>${k}</code> ${fmt(v)} <span class="muted">— ${LABEL[k] || ''}</span>`)
+      .join('<br>');
+  }
+
+  // Offer the retry list whenever anything is outstanding, so an aborted or
+  // partly-failed run can be finished without re-uploading the whole sheet.
+  const retry = $('#dRetry');
+  retry.hidden = !j.retryCount;
+  if (j.retryCount) {
+    let msg = `<strong>${fmt(j.retryCount)} ASIN(s) unresolved.</strong> `;
+    msg += j.state === 'stopped'
+      ? `Job was stopped by hand. `
+      : `Recorded as <code>panel_unresolved</code> and re-offered by ` +
+        `<code>/backlog</code> — no inline retry, so they cost nothing until you ` +
+        `choose to run them. `;
+    msg += `<a href="/jobs/${j.id}/retry.csv">Download the list</a>.`;
+    retry.innerHTML = msg;
+  }
+
+  $('#dAborted').hidden = !j.aborted;
+  if (j.aborted) {
+    // Throttling is the one abort reason that means "move this server", not
+    // "fix the code", so it gets called out rather than buried in the message.
+    $('#dAborted').className = 'note ' + (j.throttleSuspected ? 'bad' : 'warn');
+    $('#dAborted').innerHTML = (j.throttleSuspected
+      ? '<strong>Stopped — this IP looks throttled.</strong> '
+      : '<strong>Stopped early.</strong> ') + j.aborted;
+  }
+  $('#dError').hidden = !j.error;
+  if (j.error) $('#dError').innerHTML = `<strong>Failed.</strong> ${j.error}`;
+
+  $('#stop').hidden = j.completed;
+}
+
+$('#stop').addEventListener('click', async () => {
+  if (!selected) return;
+  $('#stop').disabled = true;
+  await fetch(`/jobs/${selected}/stop`, { method: 'POST' }).catch(() => {});
+  $('#stop').disabled = false;
+  load();
+});
+
+async function load() {
+  let d;
+  try {
+    d = await (await fetch('/jobs')).json();
+  } catch {
+    $('#tick').textContent = 'Server unreachable — retrying…';
+    return;
+  }
+
+  const jobs = d.jobs;
+  $('#noJobs').hidden = jobs.length > 0;
+
+  // With no explicit selection, show the running job, else the newest.
+  if (!selected && jobs.length) selected = (jobs.find((j) => j.state === 'running') || jobs[0]).id;
+
+  const job = jobs.find((j) => j.id === selected);
+  if (job) renderDetail(job);
+  else $('#detail').hidden = true;
+
+  $('#all').tBodies[0].innerHTML = jobs.map((j) => `
+    <tr>
+      <td><a class="mono" href="?job=${j.id}">${j.id.slice(0, 8)}</a></td>
+      <td>${j.filename ? j.filename.replace(/[<>&]/g, '') : '<span class="muted">—</span>'}</td>
+      <td><span class="pill ${j.state}">${j.state}</span></td>
+      <td><div class="bar" title="${j.processed}/${j.total}"><i style="width:${j.percent}%"></i></div></td>
+      <td class="num">${fmt(j.total)}</td>
+      <td class="num">${fmt(j.found)}</td>
+      <td class="num">${fmt(j.missing)}</td>
+      <td class="num">${fmt(j.errors)}</td>
+      <td class="num">${fmt(j.insertedFound + j.insertedMissing)}</td>
+      <td class="muted">${j.finishedAt ? new Date(j.finishedAt).toLocaleString() : '—'}</td>
+    </tr>`).join('');
+
+  const running = jobs.some((j) => j.state === 'running');
+  $('#tick').textContent =
+    (running ? 'Running — refreshing every 3s.' : 'Idle.') +
+    ` ${d.queued} job(s) queued.`;
+}
+
+// Selecting from the table should not reload the page.
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[href^="?job="]');
+  if (!a) return;
+  e.preventDefault();
+  selected = new URLSearchParams(a.getAttribute('href').slice(1)).get('job');
+  history.replaceState({}, '', `/status.html?job=${selected}`);
+  load();
+});
+
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>
