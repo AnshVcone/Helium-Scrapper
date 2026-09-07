@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { config } from './config.js';
 
 // Automated Helium 10 sign-in, so a deployed run does not need a human.
@@ -28,6 +30,191 @@ export function getCreds() {
   const password = process.env.H10_PASSWORD;
   if (!email || !password) return null;
   return { email, password };
+}
+
+// A session cookie lifted from a browser where a human signed in. This is the
+// way around the reCAPTCHA that does not involve defeating it: the human solves
+// it once in their own Chrome, and the scraper borrows the resulting session.
+//
+// Copy it from DevTools -> Application -> Cookies -> members.helium10.com ->
+// _identity, and put the value in .env as H10_IDENTITY_COOKIE.
+export function getIdentityCookie() {
+  const v = (process.env.H10_IDENTITY_COOKIE || '').trim();
+  return v || null;
+}
+
+// Attributes are copied from a real _identity row rather than guessed:
+//   host_key members.helium10.com | path / | secure 0 | httponly 1 | samesite Lax
+// Host-only, not `.helium10.com` -- a domain cookie is a different cookie as far
+// as the browser is concerned, and getting it wrong means it is simply not sent.
+const IDENTITY = {
+  name: '_identity',
+  domain: 'members.helium10.com',
+  path: '/',
+  httpOnly: true,
+  secure: false,
+  sameSite: 'Lax',
+};
+
+/**
+ * Put the configured session cookie into the context. Returns false if none is
+ * configured. Does not verify anything -- callers check the result themselves.
+ */
+export async function injectIdentityCookie(ctx) {
+  const value = getIdentityCookie();
+  if (!value) return false;
+  await ctx.addCookies([{ ...IDENTITY, value }]);
+  return true;
+}
+
+// A whole exported cookie set, rather than one cookie.
+//
+// `_identity` alone was tried first and the server cleared it on sight. Yii's
+// auto-login is not the only thing gating that session: there is a session id
+// and a CSRF cookie alongside it, and presenting a bare auth cookie with no
+// matching session looks exactly like a replayed token -- which is presumably
+// why it is rejected rather than ignored.
+//
+// So take the lot. Export the helium10.com cookies from a browser that is signed
+// in (DevTools -> Application, or any cookie-export extension), save the JSON
+// array as cookies.json, and point H10_COOKIES_FILE at it.
+//
+// Accepts both common shapes: Playwright's own ({name, value, domain, path,
+// httpOnly, secure, sameSite, expires}) and the EditThisCookie/Chrome format
+// ({hostOnly, session, expirationDate, sameSite: "no_restriction"|...}).
+export function getCookiesFile() {
+  return (process.env.H10_COOKIES_FILE || '').trim() || null;
+}
+
+const SAMESITE = {
+  no_restriction: 'None', none: 'None', unspecified: 'Lax',
+  lax: 'Lax', strict: 'Strict',
+};
+
+export async function injectCookieFile(ctx) {
+  const file = getCookiesFile();
+  if (!file) return { injected: 0 };
+
+  const abs = path.isAbsolute(file) ? file : path.join(config.root, file);
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(abs, 'utf8'));
+  } catch (e) {
+    return { injected: 0, error: `could not read ${abs}: ${e.message}` };
+  }
+  const list = Array.isArray(raw) ? raw : raw.cookies;
+  if (!Array.isArray(list)) return { injected: 0, error: 'expected a JSON array of cookies' };
+
+  const cookies = [];
+  for (const c of list) {
+    if (!c || !c.name || c.value === undefined) continue;
+    // Only helium10. A dump from a live browser carries every site the person
+    // has visited, and injecting unrelated sessions into a scraper is both
+    // pointless and a privacy problem.
+    const domain = String(c.domain || '');
+    if (!/helium10\.com$/i.test(domain.replace(/^\./, ''))) continue;
+
+    const out = {
+      name: c.name,
+      value: String(c.value),
+      domain,
+      path: c.path || '/',
+      httpOnly: !!c.httpOnly,
+      secure: !!c.secure,
+    };
+    const ss = SAMESITE[String(c.sameSite || '').toLowerCase()];
+    if (ss) out.sameSite = ss;
+    // A session cookie has no expiry; anything else keeps the one it had.
+    const exp = c.expires ?? c.expirationDate;
+    if (exp && exp > 0 && !c.session) out.expires = Math.floor(exp);
+    cookies.push(out);
+  }
+
+  if (!cookies.length) return { injected: 0, error: 'no helium10.com cookies in the file' };
+  await ctx.addCookies(cookies);
+  return { injected: cookies.length, names: cookies.map((c) => c.name) };
+}
+
+export const Session = {
+  LIVE: 'LIVE',                     // already signed in
+  LIVE_VIA_COOKIE: 'LIVE_VIA_COOKIE', // the injected cookie worked
+  SITE_ONLY: 'SITE_ONLY',           // site session works, panel does not
+  DEAD: 'DEAD',                     // nothing worked
+};
+
+/**
+ * Get to a usable session without ever submitting the login form.
+ *
+ * Order matters: check first, inject only if needed. Re-injecting over a working
+ * session is pointless and would overwrite a fresher cookie with a staler one.
+ *
+ * SITE_ONLY is a real and non-obvious outcome. Signing in at the plain website
+ * authenticates the *site*; the extension gets its session through the
+ * `type=chrome-extension` flow and keeps its own token in
+ * Default/Local Extension Settings. So a borrowed website cookie can leave
+ * isLoggedIn() true while the panel still reads "Please log in to launch" --
+ * which is why the caller must judge on the panel, not on this alone.
+ */
+export async function ensureSession(ctx, page) {
+  if (await isLoggedIn(page)) return { status: Session.LIVE };
+
+  // Prefer the full set: a lone auth cookie was rejected outright by the server.
+  const file = await injectCookieFile(ctx);
+  if (file.injected) {
+    if (await isLoggedIn(page)) {
+      return { status: Session.LIVE_VIA_COOKIE, injected: file.injected, names: file.names };
+    }
+    return {
+      status: Session.DEAD,
+      reason: `injected ${file.injected} cookie(s) from H10_COOKIES_FILE but the server did not accept them`,
+    };
+  }
+
+  if (await injectIdentityCookie(ctx)) {
+    if (await isLoggedIn(page)) return { status: Session.LIVE_VIA_COOKIE, injected: 1 };
+    return { status: Session.DEAD, reason: 'H10_IDENTITY_COOKIE was rejected by the server' };
+  }
+
+  return {
+    status: Session.DEAD,
+    reason: file.error || 'no H10_COOKIES_FILE or H10_IDENTITY_COOKIE configured',
+  };
+}
+
+/**
+ * Touch the Helium 10 site so its session does not idle out.
+ *
+ * A run only ever loads amazon.com pages. helium10.com is never requested for
+ * the whole run, so if the session has an *idle* timeout we are guaranteed to
+ * trip it. Three runs died at 32, 6 and 29 minutes; with other logins ruled out
+ * by a controlled test, a ~30 minute idle expiry is the best remaining
+ * explanation -- and `_identity` claiming an expiry a month out is not evidence
+ * against it, because the cookie's lifetime and the server-side session's
+ * lifetime are different things.
+ *
+ * Done in a throwaway tab in the same context, so it shares the cookie jar (no
+ * new device, no new login) and cannot disturb the Amazon page mid-extraction.
+ *
+ * Returns {alive} -- false means the site bounced us to signin, which is an
+ * early warning worth logging before the next ASIN fails on it.
+ */
+export async function touchSession(ctx) {
+  let tab;
+  try {
+    tab = await ctx.newPage();
+    await tab.goto('https://members.helium10.com/dashboard', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+    const alive = !/\/user\/signin/.test(tab.url());
+    return { alive };
+  } catch (e) {
+    // A keep-alive must never be able to end a run. A failure here is worth a
+    // log line and nothing more.
+    return { alive: null, error: String(e.message || e).slice(0, 120) };
+  } finally {
+    await tab?.close().catch(() => {});
+  }
 }
 
 // Redact anything that looks like the secret before it can reach a log line.

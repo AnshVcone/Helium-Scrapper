@@ -4,9 +4,11 @@ import path from 'node:path';
 import express from 'express';
 import multer from 'multer';
 import { config } from './config.js';
-import { loadEnv, ping, getPool, writeMissing, MissingReason,
+import { loadEnv, ping, getPool, writeMissing, MissingReason, UnresolvedCode,
          backlogAsins, backlogCount } from './db.js';
 import { runJob, parseAsins } from './runner.js';
+import { notifyEvent, notifyJobDone, notifyIdle, notifyDbDown, notifyStartup,
+         notifyConfigured } from './notify.js';
 
 loadEnv();
 
@@ -45,6 +47,16 @@ const jobs = new Map();
 const queue = [];
 let active = null;
 
+// runner Status -> the error_code stored beside panel_unresolved. The reason
+// column carries the retry decision; this says which way the read failed.
+const UNRESOLVED_CODE = {
+  TIMEOUT: UnresolvedCode.TIMEOUT,
+  BLOCKED: UnresolvedCode.BLOCKED,
+  SHAPE_UNKNOWN: UnresolvedCode.SHAPE_UNKNOWN,
+  DISCONNECTED: UnresolvedCode.DISCONNECTED,
+  NOT_LOGGED_IN: UnresolvedCode.LOGGED_OUT,
+};
+
 const JOBS_FILE = path.join(config.root, 'output', 'jobs.json');
 const retryPath = (id) => path.join(config.root, 'output', `retry-${id}.csv`);
 
@@ -70,6 +82,8 @@ function restore() {
     for (const j of saved) {
       j._stop = false;
       j._retryAsins = [];
+      j._attemptedAsins = [];
+      j._neverAttemptedAsins = [];
       const interrupted = j.state === 'running' || j.state === 'queued';
 
       if (interrupted && Array.isArray(j._asins) && j._asins.length) {
@@ -137,7 +151,8 @@ function newJob({ asins, rejected = [], marketplace, filename }) {
 
 // Strip internals before returning a job over HTTP.
 function view(job) {
-  const { _asins, _stop, _retryAsins, _retryDetail, ...rest } = job;
+  const { _asins, _stop, _retryAsins, _attemptedAsins, _neverAttemptedAsins,
+          _retryDetail, ...rest } = job;
   // Skipped ASINs are resolved work, so they count toward completion -- without
   // this the bar would stall below 100% on any re-upload.
   const accounted = rest.processed + rest.skipped;
@@ -146,7 +161,7 @@ function view(job) {
     ...rest,
     remaining,
     percent: rest.total ? Math.round((accounted / rest.total) * 100) : 0,
-    completed: ['completed', 'failed', 'stopped'].includes(rest.state),
+    completed: ['completed', 'aborted', 'failed', 'stopped'].includes(rest.state),
   };
 }
 
@@ -168,6 +183,12 @@ async function pump() {
       marketplace: job.marketplace,
       fetchDate: job.fetchDate,
       shouldStop: () => job._stop,
+      // Fire-and-forget on purpose. notify() swallows its own failures, so there
+      // is nothing here worth awaiting and nothing that can reject -- and making
+      // the ASIN loop wait on an HTTP round trip to Cliq would be absurd.
+      onEvent: (event, meta) => {
+        notifyEvent(event, { jobId: job.id, ...meta }).catch(() => {});
+      },
       onProgress: (s) => {
         Object.assign(job, {
           skipped: s.skipped,
@@ -186,6 +207,8 @@ async function pump() {
     // Persist the retry list to disk, so the ASINs needing another pass survive
     // a restart and can be re-submitted without re-uploading the whole sheet.
     job._retryAsins = summary.retryAsins || [];
+    job._attemptedAsins = summary.attemptedAsins || [];
+    job._neverAttemptedAsins = summary.neverAttemptedAsins || [];
     job._retryDetail = summary.retryDetail || {};
     if (summary.retryAsins?.length) {
       try {
@@ -209,7 +232,15 @@ async function pump() {
       aborted: summary.aborted,
       throttleSuspected: !!summary.throttleSuspected,
       current: null,
-      state: job._stop ? 'stopped' : 'completed',
+      // A run that gave up is NOT 'completed'. Reporting an abort as completed
+      // is what made a job that stopped at 126 of 545 look finished on the
+      // status page, with the reason buried in a field nobody reads.
+      state: job._stop ? 'stopped' : summary.aborted ? 'aborted' : 'completed',
+      // Diagnostics that were computed and then thrown away: without these
+      // there was no way to tell from the status page whether the false-logout
+      // guard had tripped or a real re-login had been attempted.
+      relogins: summary.relogins || 0,
+      falseLogouts: summary.falseLogouts || 0,
     });
   } catch (err) {
     job.state = 'failed';
@@ -217,21 +248,27 @@ async function pump() {
     console.error(`[server] job ${job.id} failed:`, err);
   } finally {
     job.finishedAt = new Date().toISOString();
-    const outstanding = job._retryAsins || [];
+    const attempted = job._attemptedAsins || [];
+    const neverAttempted = job._neverAttemptedAsins || [];
     // The ASIN list is the bulk of the memory; drop it once the job is done.
     job._asins = [];
     active = null;
 
     // No automatic retry. An ASIN we could not read is recorded in the missing
-    // table and re-offered by /backlog, so the next upload or backlog run picks
-    // it up. Retrying inline would re-walk the same pages in the same
-    // conditions -- on a large sheet that is hours spent re-failing.
-    if (outstanding.length && job.state !== 'stopped') {
+    // table so the next upload picks it up. Retrying inline would re-walk the
+    // same pages in the same conditions -- on a large sheet that is hours spent
+    // re-failing.
+    //
+    // Only ASINs the run actually opened are written. A run aborted at 2,000 of
+    // 5,000 never touched the last 3,000, and marking those "we tried and
+    // failed" is simply false -- they get no row, and the CSV you re-upload is
+    // the record that they are still owed.
+    if (attempted.length) {
       const detail = job._retryDetail || {};
-      const entries = outstanding.map((asin) => ({
+      const entries = attempted.map((asin) => ({
         asin,
         reason: MissingReason.UNRESOLVED,
-        errorCode: detail[asin] || 'UNKNOWN',
+        errorCode: UNRESOLVED_CODE[detail[asin]] || UnresolvedCode.TIMEOUT,
         errorMessage: `no reading this run; last outcome ${detail[asin] || 'unknown'}`,
       }));
       try {
@@ -239,8 +276,8 @@ async function pump() {
         job.insertedMissing += n;
         job.unresolvedWritten = n;
         console.log(
-          `[server] ${outstanding.length} ASIN(s) unresolved; wrote ${n} as ` +
-          `${MissingReason.UNRESOLVED} (re-offered by /backlog, not retried inline)`,
+          `[server] wrote ${n} ${MissingReason.UNRESOLVED} row(s); ` +
+          `${neverAttempted.length} ASIN(s) were never reached and got none`,
         );
       } catch (e) {
         console.error('[server] could not record unresolved ASINs:', e.message);
@@ -248,8 +285,93 @@ async function pump() {
     }
 
     persist();
+
+    // The end-of-run report. Sent for every terminal state including failure --
+    // "the job died" is more worth knowing than "the job finished", and both
+    // arrive the same way so neither depends on someone watching /status.html.
+    //
+    // Deliberately after persist() and before pump(): the job record is already
+    // durable, and the next queued job does not wait on a webhook round trip.
+    let backlogRemaining = null;
+    try {
+      const counts = await backlogCount({ marketplace: job.marketplace });
+      backlogRemaining = Number(counts.outstanding);
+    } catch (e) {
+      // A backlog figure is a nice-to-have in the report; losing it must not
+      // cost the report itself.
+      console.error('[server] backlog count for the completion alert failed:', e.message);
+    }
+    notifyJobDone(job, { backlogRemaining }).catch(() => {});
+    // Work happened, so the idle clock restarts from here.
+    lastJobFinishedAt = Date.now();
+
     pump();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Idle watchdog
+// ---------------------------------------------------------------------------
+//
+// Every alert above fires from inside a run. None can report the failure mode
+// that matters most on a multi-day sweep: a run aborted at 3am, leaving a
+// healthy process and an empty queue -- silent by every other measure.
+//
+// The trigger is deliberately NOT "there is backlog in the database". Work only
+// arrives by CSV upload now, so an idle box with backlog outstanding is usually
+// just waiting for you, and alerting on that would cry wolf every night.
+//
+// What is always wrong is an *abnormal* end with nothing picked up since: the
+// last job aborted or failed, no new upload has arrived, and hours have passed.
+// That is the run nobody noticed had stopped.
+let lastJobFinishedAt = Date.now();
+
+const IDLE_ALERT_HOURS = Number(process.env.IDLE_ALERT_HOURS || 3);
+const IDLE_CHECK_MS = 15 * 60 * 1000;
+
+async function idleCheck() {
+  if (active || queue.length) {
+    lastJobFinishedAt = Date.now();
+    return;
+  }
+  const idleHours = (Date.now() - lastJobFinishedAt) / 3600000;
+  if (idleHours < IDLE_ALERT_HOURS) return;
+
+  // Only an abnormal ending is worth waking someone for. A job that completed
+  // cleanly and no upload since means the sweep is between sheets, which is a
+  // normal state and not news.
+  const last = [...jobs.values()]
+    .filter((j) => j.finishedAt)
+    .sort((a, b) => a.finishedAt.localeCompare(b.finishedAt))
+    .pop();
+  if (!last || !(last.aborted || last.state === 'failed')) return;
+
+  let outstanding = null;
+  try {
+    const counts = await backlogCount({ marketplace: last.marketplace || 'US' });
+    outstanding = Number(counts.outstanding);
+  } catch (e) {
+    // An unreachable database is itself the alert -- and on a fresh VM it is the
+    // single most likely cause, since the egress IP has to be whitelisted by
+    // hand on the staging host.
+    notifyDbDown(e.message).catch(() => {});
+    return;
+  }
+
+  notifyIdle({
+    idleHours,
+    backlogRemaining: outstanding,
+    reason: brief(last.error || last.aborted),
+    unfinished: Math.max(0, (last.total || 0) - ((last.processed || 0) + (last.skipped || 0))),
+  }).catch(() => {});
+}
+
+// Trim a terminal-length message down to one clause for an alert line.
+function brief(text) {
+  const t = String(text || '').trim().replace(/\s+/g, ' ');
+  const stop = t.search(/\.\s|\.$/);
+  const cut = stop > 0 ? t.slice(0, stop) : t;
+  return cut.length > 80 ? cut.slice(0, 79).trimEnd() + '…' : cut;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,10 +429,9 @@ app.post('/jobs', upload.single('file'), (req, res) => {
 // failure caused by a throttled IP should not be a permanent verdict.
 app.get('/backlog', async (req, res) => {
   const marketplace = (req.query.marketplace || 'US').toString().toUpperCase();
-  const fetchDate = new Date().toISOString().slice(0, 10);
   try {
-    const counts = await backlogCount({ marketplace, fetchDate });
-    res.json({ marketplace, fetchDate, ...counts });
+    const counts = await backlogCount({ marketplace });
+    res.json({ marketplace, ...counts });
   } catch (err) {
     res.status(503).json({ error: String(err.message || err) });
   }
@@ -320,39 +441,28 @@ app.get('/backlog', async (req, res) => {
 app.get('/backlog.csv', async (req, res) => {
   const marketplace = (req.query.marketplace || 'US').toString().toUpperCase();
   const limit = Math.min(Number(req.query.limit) || 1000, 200000);
-  const fetchDate = new Date().toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
   try {
-    const asins = await backlogAsins({ marketplace, fetchDate, limit });
+    const asins = await backlogAsins({ marketplace, limit });
     res.type('text/csv')
-       .set('Content-Disposition', `attachment; filename="backlog-${fetchDate}.csv"`)
+       .set('Content-Disposition', `attachment; filename="backlog-${today}.csv"`)
        .send(asins.join('\n') + (asins.length ? '\n' : ''));
   } catch (err) {
     res.status(503).type('text/plain').send(String(err.message || err));
   }
 });
 
-// One call to start working the backlog -- no download, no upload.
-//   curl -X POST 'localhost:8090/jobs/from-backlog?limit=500'
-app.post('/jobs/from-backlog', async (req, res) => {
-  const marketplace = (req.query.marketplace || 'US').toString().toUpperCase();
-  const limit = Math.min(Number(req.query.limit) || 500, 200000);
-  const fetchDate = new Date().toISOString().slice(0, 10);
-  try {
-    const asins = await backlogAsins({ marketplace, fetchDate, limit });
-    if (!asins.length) {
-      return res.status(200).json({ accepted: 0, message: 'backlog is empty for today' });
-    }
-    const job = newJob({ asins, marketplace, filename: `backlog-${fetchDate}` });
-    res.status(202).json({
-      jobId: job.id,
-      accepted: asins.length,
-      state: job.state,
-      statusUrl: `/jobs/${job.id}`,
-    });
-  } catch (err) {
-    res.status(503).json({ error: String(err.message || err) });
-  }
-});
+// There is deliberately no endpoint that starts a job from the backlog.
+//
+// The scraper runs what you upload and nothing else. A job's ASIN list comes
+// from exactly two places -- POST /jobs (your CSV) and restore() replaying that
+// same list after a restart -- and neither invents work from the database. The
+// backlog views below are read-only: /backlog.csv hands you a file, and it is
+// your decision to upload it.
+//
+// This reverses the 2026-08-27 "no local state" design, where a replacement
+// server rebuilt its work list from the DB alone. The trade is deliberate: a new
+// box now needs the CSV, so keep the sheets somewhere you can re-upload from.
 
 app.get('/jobs', (_req, res) => {
   res.json({
@@ -409,14 +519,28 @@ const server = app.listen(port, () => {
   console.log(`  POST /jobs/:id/stop stop a running job`);
   console.log(`  GET  /health        db connectivity`);
   console.log(`  GET  /backlog       outstanding count, derived from the DB`);
-  console.log(`  GET  /backlog.csv   that list as CSV`);
-  console.log(`  POST /jobs/from-backlog?limit=N   scrape it directly`);
+  console.log(`  GET  /backlog.csv   that list as CSV, to upload if you choose`);
+  console.log(
+    notifyConfigured()
+      ? `  alerts -> Zoho Cliq (idle warning after ${IDLE_ALERT_HOURS}h with backlog outstanding)`
+      : `  alerts -> DISABLED (CLIQ_WEBHOOK_URL is not set)`,
+  );
+  // Announce the boot. On a box that is expected to grind for days, an
+  // unexplained restart is a signal in itself -- and it doubles as proof the
+  // webhook still works from this host's egress IP, which is the one thing no
+  // amount of local testing can establish.
+  notifyStartup({ port }).catch(() => {});
 });
+
+// Unref'd so the interval can never be the reason the process refuses to exit.
+const idleTimer = setInterval(() => { idleCheck().catch(() => {}); }, IDLE_CHECK_MS);
+idleTimer.unref();
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, async () => {
     console.log(`\n${sig} -- shutting down`);
     if (active) jobs.get(active)._stop = true;
+    clearInterval(idleTimer);
     server.close();
     await getPool().end().catch(() => {});
     process.exit(0);

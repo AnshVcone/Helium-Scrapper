@@ -26,6 +26,10 @@ cp .env.example .env      # fill H10_EMAIL/H10_PASSWORD + DB_* (see §3)
 npm run fetch-ext         # downloads + unpacks the extension into vendor/
 npm run dbcheck           # proves the DB is reachable and the tables have the columns
 npm run auth              # proves the Helium 10 credentials work
+npm run login             # headed sign-in that WAITS while you solve the CAPTCHA
+npm run profile:save      # session -> profile-seed.tar.gz (~220 KB, a CREDENTIAL)
+npm run profile:load      # restore it on another box, then re-run `npm run auth`
+npm run notifycheck       # proves Cliq alerts reach the channel from THIS host
 npm run probe B0BCJFJV4W  # proves the panel parses; writes output/probe-*.json
 npm run serve             # http://localhost:8090
 ```
@@ -150,8 +154,8 @@ maps it to `null`.
 |---|---|---|
 | `OK` | research | A stable, shape-valid figure was read |
 | `NO_DATA` | missing / `panel_no_data` | Panel rendered; no estimate exists |
-| `REDIRECTED` | missing / `panel_redirected` | Amazon served another ASIN. **Numbers discarded** |
-| `DEAD` | missing / `panel_asin_dead` | Genuine not-found page |
+| `REDIRECTED` | missing / `panel_no_data` + `served_other_asin` | Amazon served another ASIN. **Numbers discarded** |
+| `DEAD` | missing / `panel_no_data` + `asin_dead` | Genuine not-found page |
 | `TIMEOUT` | **nothing** | No trustworthy reading. Retried later |
 | `BLOCKED` | **nothing** | Bot wall. Backs off, then aborts |
 | `SHAPE_UNKNOWN` | **nothing** | Panel markup changed — **aborts the run** |
@@ -189,19 +193,35 @@ under the same conditions; on a 5,000-ASIN sheet that is hours spent re-failing.
 startup from `output/jobs.json`; the ledger means it only pays for what had not settled.
 (`restore()` must call `pump()` — forgetting that left restored jobs queued forever.)
 
-## 8. Stateless server hopping
+## 8. The scraper only runs what you upload
 
-`/backlog` derives outstanding work from the database alone, so a replacement server needs
-no CSV and no migrated job file:
+A job's ASIN list comes from your CSV and nowhere else — `POST /jobs`, or `restore()`
+replaying that same list after a restart. The database is only ever used *subtractively*,
+to drop ASINs already settled. `POST /jobs/from-backlog` existed and was **removed**.
 
 ```bash
-curl localhost:8090/backlog                    # counts
-curl -X POST 'localhost:8090/jobs/from-backlog?limit=500'
+curl localhost:8090/backlog                    # counts, read-only
+curl 'localhost:8090/backlog.csv?limit=500'    # a file you may choose to upload
 ```
 
 Backlog = ASINs in the missing table with reason `not_returned`, `call_failed` or
-`panel_unresolved`, minus anything settled today. Our own failures come back around;
-genuine findings do not.
+`panel_unresolved`, minus anything settled **on any date**. Our own failures come back
+around; genuine findings do not.
+
+This reverses the original "no local state" design: a replacement server now needs the
+CSV, so keep the sheets somewhere you can re-upload from.
+
+**The skip check is date-agnostic and that is load-bearing.** It used to ask "settled
+today?", which broke every resume: a 5,000-ASIN sheet takes 17-28h, so it always crosses
+a UTC midnight, and the morning re-upload re-scraped everything. `/backlog` had the same
+flaw and was re-offering 1,877 already-resolved ASINs.
+
+**Reasons are two values, not five.** `panel_no_data` (final) and `panel_unresolved`
+(retried). `panel_redirected` / `panel_asin_dead` folded into `panel_no_data` with
+`error_code` carrying the distinction; `panel_error` and `panel_unresolved_after_retries`
+were deleted as never-written. `writeMissing()` refuses anything else at runtime — the
+column is unconstrained text and a typo would otherwise create an ASIN that is neither
+skipped nor retried. `node scripts/migrate-reasons.mjs --apply` folds an older DB in.
 
 ## 9. Deploying
 

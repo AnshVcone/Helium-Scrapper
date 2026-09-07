@@ -7,7 +7,12 @@
   "scripts": {
     "fetch-ext": "node scripts/fetch-extension.mjs",
     "auth": "node src/authcheck.js",
+    "session": "node src/sessioncheck.js",
+    "login": "node scripts/manual-login.mjs",
+    "profile:save": "node scripts/profile-seed.mjs save",
+    "profile:load": "node scripts/profile-seed.mjs load",
     "dbcheck": "node src/dbcheck.js",
+    "notifycheck": "node src/notifycheck.js",
     "probe": "node src/probe.js",
     "scrape": "node src/scrape.js",
     "serve": "node src/server.js"

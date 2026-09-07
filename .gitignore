@@ -11,6 +11,15 @@ service-account*.json
 # Browser profile: holds the live Helium 10 session cookies.
 profile/
 
+# The portable session seed from `npm run profile:save`. This is a CREDENTIAL --
+# whoever holds it is signed in as the shared H10 account with no password. It
+# must never be committed, and it must never travel through chat or email.
+profile-seed.tar.gz
+
+# Exported browser cookies for the session workaround -- a live session, so a
+# credential. Same rules as profile-seed.tar.gz.
+cookies.json
+
 # Scraped output, job history and panel dumps -- data, not code, and probe
 # dumps contain full page text.
 output/

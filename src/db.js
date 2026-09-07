@@ -27,7 +27,10 @@ export function getPool() {
     password: DB_PASS,
     max: Number(process.env.DB_POOL_MAX || 5),
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 15000,
+    // The staging host is reached over the public internet, so getting a
+    // connection is the flaky part rather than running the query. 15s was not
+    // enough: a blip aborted the ledger lookup mid-run.
+    connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 30000),
   });
 
   // A pool error with no listener takes the process down.
@@ -127,19 +130,53 @@ export async function writeFound(rows, marketplace, fetchDate) {
   return rows.length;
 }
 
-// Reasons are scraper-specific so a panel miss is distinguishable from the Go
-// sync's 'not_returned' / 'call_failed'.
+// The scraper writes exactly TWO reasons, and the split is the retry decision
+// itself -- readable straight off the row, without consulting this file:
+//
+//   panel_no_data     we read the panel and Helium 10 has no estimate.  FINAL.
+//   panel_unresolved  we never got a stable reading.                    RETRIED.
+//
+// Everything else that used to be a reason -- redirected, dead -- answers the
+// same retry question the same way ("no data for this ASIN, and trying again
+// will not change that"), so it is a *detail*, not a category. The detail lives
+// in error_code, which the table already has. Nothing is lost and the two
+// categories stay unambiguous.
+//
+// Prefixed `panel_` so a scraper miss is always distinguishable from the Go
+// sync's 'not_returned' / 'call_failed' in the same column.
 export const MissingReason = {
   NO_DATA: 'panel_no_data',
-  REDIRECTED: 'panel_redirected',
-  DEAD: 'panel_asin_dead',
-  ERROR: 'panel_error',
-  // We could not get a reading. Deliberately distinct from panel_no_data: that
-  // means Helium 10 has no estimate, this means we never managed to read one.
-  // Conflating them would turn our own failures into apparent facts about the
-  // product.
   UNRESOLVED: 'panel_unresolved',
 };
+
+// Why a panel_no_data row has no data. Settled either way -- this only says
+// which kind of nothing it was.
+export const NoDataCode = {
+  NO_ESTIMATE: 'no_estimate',        // panel settled on $0 / N/A
+  SERVED_OTHER_ASIN: 'served_other_asin', // Amazon returned a different product
+  ASIN_DEAD: 'asin_dead',            // product page does not exist
+};
+
+// Why a panel_unresolved row was not read. All retryable.
+//
+// There is deliberately no 'not_attempted' code: an ASIN the run never reached
+// gets no row at all. Writing one would claim we tried, and the uploaded CSV is
+// already the record of what was asked for.
+export const UnresolvedCode = {
+  TIMEOUT: 'timeout',                // panel never settled
+  BLOCKED: 'blocked',                // bot wall
+  SHAPE_UNKNOWN: 'shape_unknown',    // panel rendered but did not parse
+  DISCONNECTED: 'disconnected',      // browser died
+  LOGGED_OUT: 'logged_out',          // H10 session lost, re-login failed
+};
+
+// The complete set this scraper may write. `reason` is plain text with no CHECK
+// constraint -- adding one would mean a schema change on a table the Go sync
+// shares, and would break that sync the moment it wrote a value we had not
+// anticipated. So the guard is at runtime instead: a typo here would otherwise
+// write a reason belonging to no category, which is never skipped and never
+// retried -- an ASIN that silently disappears from the sweep.
+const WRITABLE_REASONS = new Set(Object.values(MissingReason));
 
 export async function writeMissing(entries, marketplace, fetchDate) {
   if (!entries.length) return 0;
@@ -147,6 +184,12 @@ export async function writeMissing(entries, marketplace, fetchDate) {
   const values = [];
   const tuples = [];
   for (const e of entries) {
+    if (!WRITABLE_REASONS.has(e.reason)) {
+      throw new Error(
+        `refusing to write unknown reason "${e.reason}" for ${e.asin}. ` +
+        `The scraper may only write: ${[...WRITABLE_REASONS].join(', ')}`,
+      );
+    }
     const base = values.length;
     tuples.push(
       `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, NOW())`,
@@ -173,96 +216,121 @@ export async function writeMissing(entries, marketplace, fetchDate) {
   return entries.length;
 }
 
-// Which of these ASINs already have a row for this marketplace/date, in either
-// table. The two tables together ARE the ledger of settled work: a terminal
-// outcome is written, a transient failure is not. So this one query answers both
-// "have we already scraped it today" and "what still needs retrying".
-export async function existingKeys(asins, marketplace, fetchDate) {
+// Which of these ASINs were settled recently enough to skip.
+//
+// "Recently enough" is `skipIfSettledWithinDays` (default 2: today and
+// yesterday), not "today" and not "ever". Both extremes are wrong:
+//
+//   today  -- the original bug. A large sheet cannot finish inside one UTC day,
+//             so re-uploading the morning after an interrupted run re-scraped
+//             everything already paid for.
+//   ever   -- retires an ASIN permanently. The panel reports a 30-day trailing
+//             revenue, so the answer goes stale and has to be asked again.
+//
+// A window resumes an interrupted run for free while still letting the data be
+// refreshed later.
+//
+// Note this also honours the Go sync: an ASIN the MCP connector returned data
+// for inside the window has a row in the found table, so the scraper skips it.
+export async function existingKeys(asins, marketplace) {
   if (!asins.length) return new Set();
+  const days = config.skipIfSettledWithinDays;
   // Only *settled* rows suppress a re-scrape. An unresolved row records that we
   // failed, not an answer, so it must not block a later attempt -- otherwise an
   // ASIN would be offered as backlog and then silently skipped on upload, and
   // never scraped again.
   const sql = `
     SELECT requested_asin FROM ${tableName('helium_product_research')}
-     WHERE requested_asin = ANY($1) AND marketplace = $2 AND fetch_date = $3
+     WHERE requested_asin = ANY($1) AND marketplace = $2
+       AND fetch_date > CURRENT_DATE - $4::int
     UNION
     SELECT requested_asin FROM ${tableName('helium_product_research_missing')}
-     WHERE requested_asin = ANY($1) AND marketplace = $2 AND fetch_date = $3
-       AND reason = ANY($4)`;
+     WHERE requested_asin = ANY($1) AND marketplace = $2
+       AND reason = ANY($3)
+       AND fetch_date > CURRENT_DATE - $4::int`;
   const { rows } = await getPool().query(sql, [
-    asins, marketplace, fetchDate, SETTLED_MISSING_REASONS,
+    asins, marketplace, SETTLED_MISSING_REASONS, days,
   ]);
   return new Set(rows.map((r) => r.requested_asin));
 }
 
-// Reasons that represent a real, settled panel reading. A row carrying one of
-// these means the question is answered for today and the ASIN should not be
-// re-scraped.
-const SETTLED_MISSING_REASONS = ['panel_no_data', 'panel_redirected', 'panel_asin_dead'];
+// A settled answer. The question is closed for this ASIN and no run should ask
+// it again. Exactly one value now: redirected and dead folded into
+// panel_no_data, where they are distinguished by error_code.
+const SETTLED_MISSING_REASONS = ['panel_no_data'];
 
 // Reasons that make an ASIN a scrape candidate:
-//   not_returned / call_failed              -- the MCP sync could not get it
-//   panel_unresolved                        -- WE could not get it (e.g. a
-//                                              throttled IP). Deliberately
-//                                              re-offered: on a different server
-//                                              or a later run it may well
-//                                              succeed, so it must not be a
-//                                              permanent verdict.
-const BACKLOG_REASONS = ['not_returned', 'call_failed', 'panel_unresolved', 'panel_unresolved_after_retries'];
+//   not_returned / call_failed  -- the MCP sync could not get it
+//   panel_unresolved            -- WE could not get it (e.g. a throttled IP).
+//                                  Deliberately re-offered: on a different
+//                                  server or a later run it may well succeed,
+//                                  so it must not be a permanent verdict.
+//
+// 'panel_unresolved_after_retries' used to be listed here and is gone: nothing
+// ever wrote it. It was left over from the inline-retry design that was cut, and
+// a value nothing writes implies behaviour that does not exist.
+const BACKLOG_REASONS = ['not_returned', 'call_failed', 'panel_unresolved'];
 
-// The outstanding backlog, derived entirely from the database. This is what lets
-// a replacement server pick up where a previous one left off with no local
-// state: no CSV to keep, no job file to migrate.
-export async function backlogAsins({ marketplace = 'US', fetchDate, limit = 1000 } = {}) {
+// The outstanding backlog: ASINs the MCP sync could not serve and this scraper
+// has not settled on ANY date. Read-only visibility -- nothing here starts a
+// job. Work is only ever what you upload; see POST /jobs.
+//
+// The exclusion used to be "settled today", which meant an ASIN scraped
+// yesterday reappeared here this morning and the backlog never drained. Measured
+// on staging before the fix: 1,877 already-resolved ASINs were being re-offered.
+export async function backlogAsins({ marketplace = 'US', limit = 1000 } = {}) {
   const sql = `
     WITH candidates AS (
       SELECT DISTINCT requested_asin AS asin
         FROM ${tableName('helium_product_research_missing')}
        WHERE reason = ANY($1)
     ),
-    settled_today AS (
+    settled_recently AS (
       SELECT requested_asin AS asin
         FROM ${tableName('helium_product_research')}
-       WHERE marketplace = $2 AND fetch_date = $3
+       WHERE marketplace = $2 AND fetch_date > CURRENT_DATE - $5::int
       UNION
       SELECT requested_asin AS asin
         FROM ${tableName('helium_product_research_missing')}
-       WHERE marketplace = $2 AND fetch_date = $3 AND reason = ANY($4)
+       WHERE marketplace = $2 AND reason = ANY($3)
+         AND fetch_date > CURRENT_DATE - $5::int
     )
     SELECT c.asin
       FROM candidates c
-     WHERE NOT EXISTS (SELECT 1 FROM settled_today s WHERE s.asin = c.asin)
+     WHERE NOT EXISTS (SELECT 1 FROM settled_recently s WHERE s.asin = c.asin)
      ORDER BY c.asin
-     LIMIT $5`;
+     LIMIT $4`;
   const { rows } = await getPool().query(sql, [
-    BACKLOG_REASONS, marketplace, fetchDate, SETTLED_MISSING_REASONS, limit,
+    BACKLOG_REASONS, marketplace, SETTLED_MISSING_REASONS, limit,
+    config.skipIfSettledWithinDays,
   ]);
   return rows.map((r) => r.asin);
 }
 
-export async function backlogCount({ marketplace = 'US', fetchDate } = {}) {
+export async function backlogCount({ marketplace = 'US' } = {}) {
   const sql = `
     WITH candidates AS (
       SELECT DISTINCT requested_asin AS asin
         FROM ${tableName('helium_product_research_missing')}
        WHERE reason = ANY($1)
     ),
-    settled_today AS (
+    settled_recently AS (
       SELECT requested_asin AS asin
         FROM ${tableName('helium_product_research')}
-       WHERE marketplace = $2 AND fetch_date = $3
+       WHERE marketplace = $2 AND fetch_date > CURRENT_DATE - $4::int
       UNION
       SELECT requested_asin AS asin
         FROM ${tableName('helium_product_research_missing')}
-       WHERE marketplace = $2 AND fetch_date = $3 AND reason = ANY($4)
+       WHERE marketplace = $2 AND reason = ANY($3)
+         AND fetch_date > CURRENT_DATE - $4::int
     )
     SELECT
       (SELECT COUNT(*) FROM candidates)::bigint AS candidates,
       (SELECT COUNT(*) FROM candidates c
-         WHERE NOT EXISTS (SELECT 1 FROM settled_today s WHERE s.asin = c.asin))::bigint AS outstanding`;
+         WHERE NOT EXISTS (SELECT 1 FROM settled_recently s WHERE s.asin = c.asin))::bigint AS outstanding`;
   const { rows } = await getPool().query(sql, [
-    BACKLOG_REASONS, marketplace, fetchDate, SETTLED_MISSING_REASONS,
+    BACKLOG_REASONS, marketplace, SETTLED_MISSING_REASONS,
+    config.skipIfSettledWithinDays,
   ]);
   return { candidates: Number(rows[0].candidates), outstanding: Number(rows[0].outstanding) };
 }

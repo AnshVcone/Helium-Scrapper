@@ -32,7 +32,14 @@ export async function openBrowser({ headless = process.env.HEADLESS === '1' } = 
 
   // Extensions only load in a persistent context -- there is no way to attach
   // one to an ephemeral browser.
-  const ctx = await chromium.launchPersistentContext(config.profileDir, {
+  //
+  // One profile, one Chromium: the directory carries a SingletonLock and a
+  // second process aborts rather than risk corrupting it. That is the right
+  // behaviour, but Playwright reports it as a wall of launch flags, so the cause
+  // is translated below. It happens for real -- `npm run login` holds the
+  // profile while it waits for a CAPTCHA, and a job starting in that window
+  // (including one `restore()` re-queued on boot) dies on the lock.
+  const ctx = await launchOrExplain({
     channel: 'chromium',
     headless,
     viewport: null,
@@ -50,9 +57,28 @@ export async function openBrowser({ headless = process.env.HEADLESS === '1' } = 
 
   // MV3 background is a service worker; give it a moment to come up before the
   // first page asks for panel markup.
+  // (see launchOrExplain below for why the launch is wrapped)
   await ctx.waitForEvent('serviceworker', { timeout: 15000 }).catch(() => {});
 
   return { ctx, extensionVersion: ext.version };
+}
+
+// Translate the one launch failure that has a human cause into a message that
+// names it. Everything else is re-thrown untouched.
+async function launchOrExplain(opts) {
+  try {
+    return await chromium.launchPersistentContext(config.profileDir, opts);
+  } catch (err) {
+    if (/ProcessSingleton|SingletonLock|already in use/i.test(String(err.message))) {
+      throw new Error(
+        `The browser profile at ${config.profileDir} is already open in another ` +
+        `Chromium. Is \`npm run login\` still waiting for a sign-in, or another ` +
+        `scrape running? Only one may hold the profile at a time. Close the other ` +
+        `one and retry -- nothing was written.`,
+      );
+    }
+    throw err;
+  }
 }
 
 export async function getPage(ctx) {

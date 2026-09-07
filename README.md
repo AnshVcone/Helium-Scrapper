@@ -104,7 +104,7 @@ Version 8.42.2
 |---|---|
 | `OK` | Panel rendered, at least one of the two fields had a usable value |
 | `NO_DATA` | Panel rendered, no estimate exists for this product |
-| `REDIRECTED` | Amazon served a different ASIN. **Row is dropped, not written with numbers.** |
+| `REDIRECTED` | Amazon served a different ASIN. **Numbers are dropped**; the row records `served_other_asin` |
 | `DEAD` | ASIN does not exist on Amazon (no `#ASIN` field on the page) |
 | `EXTENSION_MISSING` | Extension not loaded — **aborts**, but only on a real product page, and only before any panel has rendered this run |
 | `NOT_LOGGED_IN` | Session dropped — re-authenticates from `.env` and re-reads that one ASIN |
@@ -228,31 +228,46 @@ and sampled in the response rather than silently dropped.
 ## Duplicates and retries
 
 **The two tables are the ledger.** Before scraping, the runner asks which of the
-uploaded ASINs already have a row for this `(marketplace, fetch_date)` in either
-table, and drops them from the queue. That covers three cases with one mechanism:
+uploaded ASINs are already settled — **on any date** — and drops them from the
+queue. One rule: *scraped and answered, never again.*
 
-- **Two sheets sharing an ASIN, same day** — the second upload skips it. Verified:
-  a 2-ASIN sheet whose ASINs were already scraped reported
-  `scraped=0 skipped=2 of 2 (100%)` and never launched a browser.
-- **Re-uploading a sheet to finish an interrupted run** — only the outstanding
-  ASINs cost anything.
-- **Retrying failures** — transient outcomes are never written to either table,
-  so they are absent from the ledger and get picked up again automatically.
+The date used to be part of that question, and it was a real bug. A 5,000-ASIN
+sheet takes **17-28 hours**, so a run cannot finish inside one UTC day. Re-upload
+the CSV the morning after a blocked run and the check asked "settled *today*?",
+got no for everything, and re-scraped 2,000 ASINs that were already paid for.
+Measured on staging before the fix, `/backlog` had the same asymmetry and was
+re-offering **1,877 already-resolved ASINs**, so the backlog never drained.
+
+Now one mechanism covers every case:
+
+- **Two sheets sharing an ASIN** — the second upload skips it, today or next month.
+- **Resuming after a block or a manual stop** — only the outstanding ASINs cost
+  anything. Verified across a day boundary: an ASIN settled on 2026-09-01 reports
+  `SKIP` when re-checked on 2026-09-02; an unresolved one reports `SCRAPE`.
+- **Retrying failures** — `panel_unresolved` is not settled, so it comes back
+  automatically.
 
 This works because a settled outcome always produces a row and a transient one
 never does. Skipping on "we tried it" rather than "we settled it" would silently
 abandon every timeout.
 
-**No inline retries.** When a job ends, any ASIN it could not read is written to
-the missing table as **`panel_unresolved`** with `error_code` set to the last
-outcome seen, and the job finishes. Nothing is re-walked in the same run.
+**No inline retries.** When a job ends, any ASIN it **actually opened** and could
+not read is written to the missing table as **`panel_unresolved`**, with
+`error_code` saying how the read failed, and the job finishes. Nothing is
+re-walked in the same run.
+
+ASINs the run never reached get **no row at all**. A run aborted at 2,000 of
+5,000 never touched the last 3,000, and recording those as failures claims we
+tried pages we never opened. The CSV you re-upload is the record that they are
+still owed. (The old code wrote them anyway — the migration deleted the six
+`NEVER_ATTEMPTED` rows it had already created.)
 
 That is deliberate. Retrying inline re-visits the same pages under the same
 conditions, and on a large sheet that is hours spent re-failing: 1,000 unresolved
 ASINs out of 5,000 would add 2-3 hours to produce, most likely, the same 1,000
-failures. Instead the failure is recorded once, and `/backlog` re-offers it for a
-later run — by which time the IP, the session or the hour has changed, which is
-what actually makes a second attempt worth anything.
+failures. Instead the failure is recorded once and comes back on the next
+upload — by which time the IP, the session or the hour has changed, which is what
+actually makes a second attempt worth anything.
 
 The list is also written to `output/retry-<jobId>.csv` and served at
 `GET /jobs/:id/retry.csv` if you want just that job's misses.
@@ -263,38 +278,73 @@ failure never suppresses a later attempt. Had the skip check counted it as
 settled, an ASIN would be offered as backlog and then silently skipped on
 upload — listed forever, scraped never.
 
+This is the one place where "the scraper already ran on it" is *not* enough to
+skip. A throttled IP produces `panel_unresolved` by the hundred, and those ASINs
+got nothing because **our** end broke, not because there is nothing there.
+
 **Interrupted runs still resume.** A job that was running when the process died
 is re-queued on startup — that is finishing the original work, not retrying
 failures. The ledger means the resumed run only pays for ASINs that had not
 settled.
 
-## Stateless server hopping
+## The scraper only runs what you upload
 
-A replacement server needs no CSV and no migrated job file — the two tables know
-what has settled, so the outstanding backlog is derived from the database.
+**A job's ASIN list comes from your CSV and nowhere else.** There are exactly two
+sources — `POST /jobs`, and `restore()` replaying that same list after a restart
+— and neither invents work from the database. The database is used only
+*subtractively*, to drop ASINs that are already settled.
+
+There is deliberately **no endpoint that starts a job from the backlog**.
+`POST /jobs/from-backlog` existed and was removed. The backlog views that remain
+are read-only:
 
 ```bash
-curl localhost:8090/backlog                       # counts
-curl 'localhost:8090/backlog.csv?limit=500'       # the list
-curl -X POST 'localhost:8090/jobs/from-backlog?limit=500'   # just start working it
+curl localhost:8090/backlog                  # counts
+curl 'localhost:8090/backlog.csv?limit=500'  # the list, as a file you may upload
 ```
 
 ```json
-{ "marketplace": "US", "fetchDate": "2026-08-27",
-  "candidates": 72197, "outstanding": 72129 }
+{ "marketplace": "US", "candidates": 73997, "outstanding": 70583 }
 ```
 
-What counts as backlog:
+This reverses the 2026-08-27 "no local state" design, in which a replacement
+server rebuilt its work list from the DB alone. **The trade is deliberate: a new
+box now needs the CSV**, so keep the sheets somewhere you can re-upload from.
 
-| Reason | In backlog? | Why |
-|---|---|---|
-| `not_returned`, `call_failed` | yes | The MCP sync could not get it — the whole point of the scraper |
-| `panel_unresolved` | **yes** | *We* could not get it. On a different server it may well succeed, so a give-up must never be a permanent verdict |
-| `panel_no_data`, `panel_redirected`, `panel_asin_dead` | no | Settled facts about the product |
-| any row in the found table for today | no | Already answered |
+### The reason vocabulary
 
-That third row is the one that makes server-hopping work: our own failures come
-back around, while genuine findings do not.
+`reason` is plain `text` — no Postgres enum, no CHECK constraint. Two writers
+share the column, and the scraper's half is exactly **two values**, chosen so the
+retry decision is readable straight off the row:
+
+| Writer | `reason` | Means | `error_code` | Retried? |
+|---|---|---|---|---|
+| MCP sync | `not_returned` | H10 API returned nothing | — | → by the scraper |
+| MCP sync | `call_failed` | H10 API call errored | — | → by the scraper |
+| **Scraper** | `panel_no_data` | Read the panel; no estimate exists | `no_estimate` · `served_other_asin` · `asin_dead` | **never — final** |
+| **Scraper** | `panel_unresolved` | Never got a stable reading | `timeout` · `blocked` · `shape_unknown` · `disconnected` · `logged_out` | **yes, next upload** |
+
+`panel_redirected` and `panel_asin_dead` used to be separate reasons. They answer
+the retry question identically — *no data for this ASIN, and trying again will
+not change that* — so they are **details, not categories**, and moved into
+`error_code`. Nothing is lost: `error_code = 'served_other_asin'` is still
+queryable, which matters while the open question of whether to scrape the
+*served* ASIN is unresolved.
+
+Two values were deleted for being written by nothing: `panel_error`, and
+`panel_unresolved_after_retries` left over from the inline-retry design that was
+cut. A value nothing writes implies behaviour that does not exist.
+
+The two MCP values are **not ours to rename** — 145,659 rows and the Go sync
+depend on them.
+
+Since the column is unconstrained text, a typo would write a reason belonging to
+no category: never skipped, never retried, an ASIN silently gone from the sweep.
+A CHECK constraint would catch it but means a schema change on a shared table,
+and would break the Go sync the moment it wrote a value we had not anticipated.
+So **the guard is at runtime** — `writeMissing()` refuses any reason outside the
+known set. Run `node scripts/migrate-reasons.mjs` (add `--apply` to write) to
+fold an older database into this vocabulary; it is idempotent and data-only.
 
 ## Throttling detection
 
@@ -317,14 +367,102 @@ than *fix the code*.
 `PANEL_TIMEOUT_MS` is also the knob to raise if a slow VM produces timeouts on
 pages that are actually fine — check that before concluding you are throttled.
 
+## Alerts (Zoho Cliq)
+
+Detection above is worthless if nobody is looking. On a sweep measured in days
+nobody watches `/status.html`, so a throttled run used to stop and the box then
+sat idle in silence. Every condition worth knowing about now posts to a Cliq
+channel.
+
+Set `CLIQ_WEBHOOK_URL` in `.env` (channel → Integrations → Incoming Webhook).
+**It carries a `zapikey`, so it is a credential** — `.env` only, never a commit.
+Leave it blank and the scraper runs exactly as before, logging once that alerts
+are off. Test it from the box it will run on:
+
+```bash
+npm run notifycheck            # one plain message
+npm run notifycheck -- --full  # one of every alert shape
+```
+
+That is the deploy-time counterpart to `npm run dbcheck`, and it exists for one
+reason: the webhook was proven from an office connection, and whether it works
+from a datacenter egress IP is a different question — the kind that is otherwise
+answered at 3am by an alert that never arrived.
+
+| Alert | Fires when | Run continues? |
+|---|---|---|
+| Throttling suspected | `THROTTLE_WARN_AT` (3) consecutive timeouts | yes |
+| IP looks throttled | `MAX_CONSECUTIVE_TIMEOUTS` (6) — run aborts | no |
+| Bot walls | `maxConsecutiveBlocked` CAPTCHA pages | no |
+| Panel markup not recognised | `maxConsecutiveUnknownShape` unparsed panels | no |
+| H10 session lost | re-login failed, or no credentials | no |
+| Extension not loaded | no launcher on the first page | no |
+| Browser died | Playwright context disconnected | no |
+| Extension version changed | panel footer ≠ `expectedExtensionVersion` | yes |
+| **Job finished** | every terminal state, including failure | — |
+| **Idle with work outstanding** | no job for `IDLE_ALERT_HOURS` (3) while the DB still has backlog | — |
+| Database unreachable | the idle check cannot reach Postgres | — |
+| Service started | boot | — |
+
+Two of those carry the load. The **job-finished report** gives counts, duration,
+the abort reason if any, and the backlog still outstanding — so the sweep's
+progress arrives without anyone asking for it. The **idle alarm** is the only one
+that can catch the failure nobody else sees: a run that aborted at 3am leaves a
+healthy process, an empty queue and an untouched backlog, which looks fine by
+every other measure. It repeats every `IDLE_REPEAT_HOURS` (6) while the
+condition holds, because a single 2am message is easy to miss.
+
+### Message shape
+
+```
+<glyph> *<what happened>* at <n>/<total> — <the number that proves it>
+→ <what to do>          only when a human must act
+<job> · <host>
+```
+
+Four lines maximum, and usually two:
+
+```
+✅ *Job done* 500/500 · 3h 12m
+209 found · 254 no-data · 25 unresolved
+Backlog: 71,629
+386d7173 · gce-scraper-a
+
+🛑 *Stopped: IP throttled* at 142/500 — 6 timeouts in a row, 358 left unwritten
+→ Redeploy on a new IP, then re-upload the CSV
+386d7173 · gce-scraper-a
+```
+
+These arrive dozens of times over a multi-day sweep, so **anything true of every
+alert, or lookup-able here once, is noise** — it trains people to skim, which
+defeats the alert. The status breakdown, the per-table write counts and the
+rejected-token tally stay on `/status.html`; this channel carries the trigger and
+the verb. Actions are one imperative, never an explanation. A run that is still
+going carries no action line at all, because "no action needed" is exactly the
+text that teaches people to stop reading.
+
+Three rules `src/notify.js` obeys, in order:
+
+1. **It can never break a scrape.** Every path catches and returns `false`. The
+   runner wraps the callback again on its side.
+2. **It can never stall the loop.** Each request carries a 10s abort timeout,
+   and the runner fires events without awaiting them.
+3. **It can never spam.** Run events dedupe per job per type — a flapping IP
+   sends one message, not one per ASIN. The completion report is exempt: it must
+   never be swallowed because a warning went out earlier.
+
+Set `SCRAPER_HOST_LABEL` once there is more than one server. Every message
+carries it, and since the IP is the thing you rotate, "which box" is the first
+thing you need to know.
+
 ## Where rows go
 
 | Panel outcome | Table | `reason` |
 |---|---|---|
 | `OK` | `helium_product_research` | — |
 | `NO_DATA` | `..._missing` | `panel_no_data` |
-| `REDIRECTED` | `..._missing` | `panel_redirected` (+ the ASIN Amazon served) |
-| `DEAD` | `..._missing` | `panel_asin_dead` |
+| `REDIRECTED` | `..._missing` | `panel_no_data` / `served_other_asin` (+ the ASIN Amazon served) |
+| `DEAD` | `..._missing` | `panel_no_data` / `asin_dead` |
 | everything else | `..._missing` | `panel_unresolved` — recorded once, re-offered by `/backlog`, never retried inline |
 
 That last row is the important one. `TIMEOUT`, `BLOCKED`, `SHAPE_UNKNOWN` and
@@ -345,6 +483,68 @@ Three details that keep the two writers compatible:
   and "Helium 10 had no value". Subcategory ranks live there too, *not* in
   `subcategories_best_sellers_rank` — existing rows key that column by
   `node_id`, which the panel does not expose.
+
+## Signing in, and moving the session between machines
+
+**Automated login works until Helium 10 escalates to a reCAPTCHA, and then it
+cannot.** Solving it is deliberately out of scope. On a laptop that is a one-off
+annoyance; on a headless VM it is a wall, because there is no screen to click.
+
+```bash
+npm run login          # opens a real window, credentials pre-filled, and WAITS
+```
+
+Unlike `npm run auth` — which reports `CAPTCHA` and exits, closing the window
+before you can touch it — this one polls for up to `LOGIN_WAIT_MINUTES` (10)
+while you solve the challenge, then closes itself once the session is live.
+
+### The session is portable
+
+Do the sign-in once, anywhere with a display, and carry the result:
+
+```bash
+npm run profile:save                      # -> profile-seed.tar.gz  (~220 KB)
+scp profile-seed.tar.gz <host>:/opt/helium10-panel-scraper/
+# on that host:
+npm run profile:load
+npm run auth                              # must say "Already signed in"
+```
+
+That makes sign-in **once per account instead of once per server**, which matters
+because the answer to a blocked IP is "redeploy elsewhere" — otherwise every hop
+would need another CAPTCHA on a box with no display.
+
+**The tarball is a credential.** Anyone holding it is signed in as the shared
+Diamond/Elite account with no password. It is gitignored and written `0600`.
+Move it with `scp`; never through chat, email, or a bucket that outlives the
+transfer.
+
+Why an allowlist of 13 paths rather than tarring the profile: the profile is
+**780 MB, of which 759 MB is `Cache` and `Code Cache`**. The session is under
+1 MB. A denylist would also risk carrying Chromium's `SingletonLock` to a machine
+where it is a lie — a stale one makes every future launch abort with *"profile
+already in use"*. `profile:load` deletes those defensively.
+
+What travels, and why each is needed: `Local State` (holds the key material the
+cookie jar is sealed with — a cookies-only copy is undecryptable), `Cookies`,
+`Login Data`, `Preferences`, `Secure Preferences`, `Local Storage`,
+`Session Storage`, `IndexedDB`, `Local Extension Settings` (the H10 extension's
+own `chrome.storage.local`, where its token lives — without it the panel asks you
+to log in again despite a valid cookie jar), `Extension State`/`Rules`/`Scripts`,
+and `Web Data`.
+
+This works because Playwright launches with `--use-mock-keychain`, so cookies are
+sealed with a fixed key rather than one derived from the macOS Keychain.
+**Verified:** a seed extracted into an empty directory on the same machine
+restored 266 cookies, 23 of them `helium10.com` with readable values. Whether a
+*signed-in* session survives the hop is the one thing only a real transfer can
+confirm — `npm run auth` on the target box is that test.
+
+Both scripts refuse to run while a Chromium holds the profile, since reading it
+mid-write yields a torn SQLite file and writing under a live browser corrupts it
+outright. `profile:load` also refuses to overwrite an existing profile without
+`--force`, because the session already there may be the only working one anyone
+has.
 
 ## Deploying on a plain GCE VM (no Docker)
 
