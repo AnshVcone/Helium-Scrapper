@@ -518,9 +518,37 @@ restore();
 pump();
 
 const port = Number(process.env.PORT || 8090);
-const server = app.listen(port, () => {
+
+// Which interface to listen on. DEFAULT IS LOOPBACK ONLY.
+//
+// This service has no authentication, and every meaningful endpoint is a write:
+// POST /jobs starts a job that writes to a shared database, /backlog.csv hands
+// over the ASIN list, POST /jobs/:id/stop kills a running sweep. On a VM with a
+// public address and no firewall rule, binding 0.0.0.0 publishes all of that to
+// anyone who scans the IP -- and cloud address ranges are scanned continuously.
+//
+// SSH credentials are not a substitute: they gate shell access, not an open TCP
+// port. Binding to loopback is what actually makes them the boundary, because
+// the only way in is then through a tunnel:
+//
+//   ssh -L 8090:localhost:8090 <user>@<vm>
+//   # then open http://localhost:8090 on your own machine
+//
+// No auth code, no IAP, no firewall rule, and the people who hold the VM
+// credentials are exactly the people who can reach the UI.
+//
+// Set BIND_HOST=0.0.0.0 to override. Do that only behind a firewall that
+// restricts port 8090, and never on a box with a public address.
+const bindHost = process.env.BIND_HOST || '127.0.0.1';
+const server = app.listen(port, bindHost, () => {
   const t = dbTarget();
-  console.log(`helium10 panel scraper listening on :${port}`);
+  console.log(`helium10 panel scraper listening on ${bindHost}:${port}`);
+  if (bindHost === '127.0.0.1' || bindHost === 'localhost') {
+    console.log(`  loopback only — reach it with:  ssh -L ${port}:localhost:${port} <user>@<host>`);
+  } else {
+    console.log(`  WARNING: bound to ${bindHost} with NO AUTHENTICATION.`);
+    console.log(`  Anyone who can reach ${bindHost}:${port} can start jobs that write to the database.`);
+  }
   console.log(
     `  MODE=${t.mode.toUpperCase()} -> writes to ${t.database} on ${t.host} ` +
     `(tables ${t.tablePrefix}helium_product_research*)`,

@@ -163,6 +163,39 @@ that back.
 
 The practical ceiling is Amazon's tolerance, not speed.
 
+## Reaching the UI safely (no auth, by design)
+
+**The service has no authentication, and it binds to `127.0.0.1` only.** Reach it
+through an SSH tunnel:
+
+```bash
+ssh -L 8090:localhost:8090 <user>@<vm>
+# then open http://localhost:8090 on your own machine
+```
+
+That is the whole access control, and it is enough — but only because of the
+loopback bind. The reasoning matters, because it is easy to get backwards:
+
+- Every useful endpoint is a **write**. `POST /jobs` starts a job that writes to
+  a shared database; `/backlog.csv` hands over the ASIN list; `POST
+  /jobs/:id/stop` kills a running sweep.
+- **SSH credentials gate a shell, not an open TCP port.** "Only our people have
+  the VM credentials" is true and still does not protect port 8090 if the port
+  is listening on a public address. Cloud IP ranges are scanned continuously.
+- Binding to loopback is what makes those credentials the real boundary: the
+  only route in is a tunnel, which requires them.
+
+So no auth code, no IAP, and no firewall rule to maintain.
+
+**On GCP specifically:** the default VPC denies all ingress except SSH, RDP and
+ICMP, so port 8090 is normally unreachable from the internet anyway. **Do not add
+an allow rule for it.** If you do, and `BIND_HOST` is `0.0.0.0`, the UI is public.
+
+`BIND_HOST=0.0.0.0` exists for the case where a firewall genuinely restricts the
+port. The boot banner prints a warning when it is set, because that combination
+plus a public address is the one configuration that hands the database to
+strangers.
+
 ## Web UI
 
 ```bash
