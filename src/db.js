@@ -11,20 +11,33 @@ import { config } from './config.js';
 
 let pool = null;
 
+const VALID_MODES = ['dev', 'staging'];
+
 // Which database a run writes to. `dev` for a test sweep, `staging` for the
 // real one.
 //
 // Default is dev, deliberately. An unconfigured box must not write to staging
 // just because someone forgot to set a variable -- the safe direction for a
 // missing value is the throwaway database, not the shared one.
-export const MODE = (process.env.SCRAPER_MODE || 'dev').toLowerCase();
-
-const VALID_MODES = ['dev', 'staging'];
-if (!VALID_MODES.includes(MODE)) {
-  throw new Error(
-    `SCRAPER_MODE is "${MODE}"; expected one of ${VALID_MODES.join(', ')}`,
-  );
+//
+// Read LAZILY, and that is not a style choice. This was a module-level const,
+// evaluated when db.js is first imported -- which happens before the entry
+// script calls loadEnv(). So SCRAPER_MODE=staging in .env was silently ignored
+// and every run used the default. Only a shell-level override worked, and
+// nothing said otherwise.
+export function scraperMode() {
+  const raw = (process.env.SCRAPER_MODE || 'dev').toLowerCase();
+  if (!VALID_MODES.includes(raw)) {
+    throw new Error(`SCRAPER_MODE is "${raw}"; expected one of ${VALID_MODES.join(', ')}`);
+  }
+  return raw;
 }
+
+// The mode the connection pool was actually built for. A pool is cached for the
+// life of the process, so if the mode changes after the first connect, every
+// later query still goes to the old database while the logs claim the new one.
+// That must be an error, not a surprise.
+let pooledMode = null;
 
 /**
  * Read a DB setting for the active mode.
@@ -39,6 +52,7 @@ if (!VALID_MODES.includes(MODE)) {
  * mode a missing DEV_DB_* is an error, not a default.
  */
 function dbSetting(key, { required = false } = {}) {
+  const MODE = scraperMode();
   const scoped = process.env[`${MODE.toUpperCase()}_DB_${key}`];
   if (scoped !== undefined && scoped !== '') return scoped;
 
@@ -64,7 +78,7 @@ function dbSetting(key, { required = false } = {}) {
 /** Host/db/user for the active mode, safe to log. Never includes the password. */
 export function dbTarget() {
   return {
-    mode: MODE,
+    mode: scraperMode(),
     host: dbSetting('HOST', { required: true }),
     port: Number(dbSetting('PORT') || 5432),
     database: dbSetting('NAME', { required: true }),
@@ -74,9 +88,20 @@ export function dbTarget() {
 }
 
 export function getPool() {
-  if (pool) return pool;
+  if (pool) {
+    if (pooledMode !== scraperMode()) {
+      throw new Error(
+        `SCRAPER_MODE changed from "${pooledMode}" to "${scraperMode()}" after the ` +
+        `connection pool was created. The pool still points at ${pooledMode}, so ` +
+        `queries would go there while logs claimed otherwise. Restart the process ` +
+        `to change mode.`,
+      );
+    }
+    return pool;
+  }
 
   const t = dbTarget();
+  pooledMode = t.mode;
   pool = new pg.Pool({
     host: t.host,
     port: t.port,

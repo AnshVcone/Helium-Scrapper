@@ -5,7 +5,7 @@ import express from 'express';
 import multer from 'multer';
 import { config } from './config.js';
 import { loadEnv, ping, getPool, writeMissing, MissingReason, UnresolvedCode,
-         backlogAsins, backlogCount, dbTarget, MODE } from './db.js';
+         backlogAsins, backlogCount, dbTarget } from './db.js';
 import { runJob, parseAsins } from './runner.js';
 import { notifyEvent, notifyJobDone, notifyIdle, notifyDbDown, notifyStartup,
          notifyConfigured } from './notify.js';

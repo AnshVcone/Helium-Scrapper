@@ -326,10 +326,24 @@ settled.
 unconfigured box must not write to the shared staging tables because someone
 forgot a variable.
 
+Two ways to set it, and a shell value beats `.env`:
+
 ```bash
-SCRAPER_MODE=dev      npm run dbcheck   # trainee DB, for rehearsals
-SCRAPER_MODE=staging  npm run dbcheck   # the shared DB the Go sync also writes
+# 1. In .env — the normal case, applies to the service and every command
+SCRAPER_MODE=staging
+
+# 2. Per command — overrides .env, for a one-off check
+SCRAPER_MODE=staging npm run dbcheck
 ```
+
+**The mode is fixed for the life of a process.** The connection pool is built on
+first use and cached, so the running server cannot switch database mid-flight:
+change `.env` and restart (`systemctl restart h10-scraper`). If `SCRAPER_MODE`
+does change under a live pool, `getPool()` throws rather than quietly keep using
+the old database while the logs claim the new one.
+
+So the intended flow is: run with `SCRAPER_MODE=dev`, check the rows, then set
+`staging` and restart for the real sweep.
 
 | Mode | Resolves from | Falls back to unprefixed `DB_*`? |
 |---|---|---|
