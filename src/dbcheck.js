@@ -1,11 +1,16 @@
 // Verifies the connection and that both target tables exist with the columns
 // this scraper writes. Run before the first real job.
-import { loadEnv, getPool, tableName, ping } from './db.js';
+import { loadEnv, getPool, tableName, ping, dbTarget } from './db.js';
 
 loadEnv();
 
-console.log(`host=${process.env.DB_HOST} db=${process.env.DB_NAME} user=${process.env.DB_USER}`);
-console.log(`prefix=${process.env.DB_TABLE_PREFIX || '(none)'}`);
+// Report the resolved target, not the raw DB_* variables -- with SCRAPER_MODE
+// in play those are only one of three possible sources, and printing them would
+// have shown staging while dev mode connected elsewhere.
+const target = dbTarget();
+console.log(`MODE=${target.mode}`);
+console.log(`host=${target.host}:${target.port} db=${target.database} user=${target.user}`);
+console.log(`prefix=${target.tablePrefix || '(none)'}`);
 
 const info = await ping();
 console.log(`connected: db=${info.db} user=${info.usr}`);

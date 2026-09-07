@@ -25,6 +25,8 @@ npx playwright install chromium
 cp .env.example .env      # fill H10_EMAIL/H10_PASSWORD + DB_* (see §3)
 npm run fetch-ext         # downloads + unpacks the extension into vendor/
 npm run dbcheck           # proves the DB is reachable and the tables have the columns
+                          #   respects SCRAPER_MODE and prints the RESOLVED target
+node scripts/init-dev-tables.mjs --apply   # create the 2 tables in a fresh dev DB
 npm run auth              # proves the Helium 10 credentials work
 npm run login             # headed sign-in that WAITS while you solve the CAPTCHA
 npm run profile:save      # session -> profile-seed.tar.gz (~220 KB, a CREDENTIAL)

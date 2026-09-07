@@ -5,7 +5,7 @@ import express from 'express';
 import multer from 'multer';
 import { config } from './config.js';
 import { loadEnv, ping, getPool, writeMissing, MissingReason, UnresolvedCode,
-         backlogAsins, backlogCount } from './db.js';
+         backlogAsins, backlogCount, dbTarget, MODE } from './db.js';
 import { runJob, parseAsins } from './runner.js';
 import { notifyEvent, notifyJobDone, notifyIdle, notifyDbDown, notifyStartup,
          notifyConfigured } from './notify.js';
@@ -381,7 +381,16 @@ function brief(text) {
 app.get('/health', async (_req, res) => {
   try {
     const info = await ping();
-    res.json({ ok: true, db: info.db, user: info.usr, activeJob: active });
+    const t = dbTarget();
+    res.json({
+      ok: true,
+      mode: t.mode,
+      db: info.db,
+      host: t.host,
+      user: info.usr,
+      tablePrefix: t.tablePrefix,
+      activeJob: active,
+    });
   } catch (err) {
     res.status(503).json({ ok: false, error: String(err.message || err) });
   }
@@ -510,7 +519,15 @@ pump();
 
 const port = Number(process.env.PORT || 8090);
 const server = app.listen(port, () => {
+  const t = dbTarget();
   console.log(`helium10 panel scraper listening on :${port}`);
+  console.log(
+    `  MODE=${t.mode.toUpperCase()} -> writes to ${t.database} on ${t.host} ` +
+    `(tables ${t.tablePrefix}helium_product_research*)`,
+  );
+  if (t.mode !== 'staging') {
+    console.log('  this is NOT the shared staging database');
+  }
   console.log(`  http://localhost:${port}/            upload form`);
   console.log(`  http://localhost:${port}/status.html job status`);
   console.log(`  POST /jobs          upload a CSV of ASINs`);

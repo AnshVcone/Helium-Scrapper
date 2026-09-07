@@ -11,27 +11,90 @@ import { config } from './config.js';
 
 let pool = null;
 
+// Which database a run writes to. `dev` for a test sweep, `staging` for the
+// real one.
+//
+// Default is dev, deliberately. An unconfigured box must not write to staging
+// just because someone forgot to set a variable -- the safe direction for a
+// missing value is the throwaway database, not the shared one.
+export const MODE = (process.env.SCRAPER_MODE || 'dev').toLowerCase();
+
+const VALID_MODES = ['dev', 'staging'];
+if (!VALID_MODES.includes(MODE)) {
+  throw new Error(
+    `SCRAPER_MODE is "${MODE}"; expected one of ${VALID_MODES.join(', ')}`,
+  );
+}
+
+/**
+ * Read a DB setting for the active mode.
+ *
+ * DEV_DB_HOST / STAGING_DB_HOST take precedence; the unprefixed DB_HOST is a
+ * fallback so an existing .env keeps working.
+ *
+ * The fallback is allowed in staging mode ONLY. This asymmetry is the whole
+ * point: the legacy unprefixed variables point at staging, so letting dev mode
+ * fall back to them would silently write a "dev test run" into the shared
+ * staging tables -- the exact accident this switch exists to prevent. In dev
+ * mode a missing DEV_DB_* is an error, not a default.
+ */
+function dbSetting(key, { required = false } = {}) {
+  const scoped = process.env[`${MODE.toUpperCase()}_DB_${key}`];
+  if (scoped !== undefined && scoped !== '') return scoped;
+
+  if (MODE === 'staging') {
+    const legacy = process.env[`DB_${key}`];
+    if (legacy !== undefined && legacy !== '') return legacy;
+  }
+
+  if (required) {
+    throw new Error(
+      `${MODE.toUpperCase()}_DB_${key} is not set, and SCRAPER_MODE=${MODE}` +
+      (MODE === 'dev'
+        ? '. Dev mode will not fall back to the unprefixed DB_* variables: ' +
+          'those point at staging, and falling back would write test data into ' +
+          'the shared tables. Set DEV_DB_HOST / DEV_DB_NAME / DEV_DB_USER / ' +
+          'DEV_DB_PASS in .env.'
+        : '.'),
+    );
+  }
+  return undefined;
+}
+
+/** Host/db/user for the active mode, safe to log. Never includes the password. */
+export function dbTarget() {
+  return {
+    mode: MODE,
+    host: dbSetting('HOST', { required: true }),
+    port: Number(dbSetting('PORT') || 5432),
+    database: dbSetting('NAME', { required: true }),
+    user: dbSetting('USER', { required: true }),
+    tablePrefix: dbSetting('TABLE_PREFIX') || '',
+  };
+}
+
 export function getPool() {
   if (pool) return pool;
 
-  const { DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS } = process.env;
-  if (!DB_HOST || !DB_NAME || !DB_USER) {
-    throw new Error('DB_HOST / DB_NAME / DB_USER missing from .env');
-  }
-
+  const t = dbTarget();
   pool = new pg.Pool({
-    host: DB_HOST,
-    port: Number(DB_PORT || 5432),
-    database: DB_NAME,
-    user: DB_USER,
-    password: DB_PASS,
-    max: Number(process.env.DB_POOL_MAX || 5),
+    host: t.host,
+    port: t.port,
+    database: t.database,
+    user: t.user,
+    password: dbSetting('PASS'),
+    max: Number(dbSetting('POOL_MAX') || 5),
     idleTimeoutMillis: 30000,
-    // The staging host is reached over the public internet, so getting a
-    // connection is the flaky part rather than running the query. 15s was not
-    // enough: a blip aborted the ledger lookup mid-run.
+    // Both hosts are reached over the public internet, so getting a connection
+    // is the flaky part rather than running the query. 15s was not enough: a
+    // blip aborted the ledger lookup mid-run.
     connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 30000),
   });
+
+  console.log(
+    `[db] SCRAPER_MODE=${t.mode} -> ${t.user}@${t.host}:${t.port}/${t.database} ` +
+    `prefix "${t.tablePrefix}"`,
+  );
 
   // A pool error with no listener takes the process down.
   pool.on('error', (err) => {
@@ -42,7 +105,7 @@ export function getPool() {
 }
 
 export function tableName(base) {
-  const prefix = process.env.DB_TABLE_PREFIX || '';
+  const prefix = dbSetting('TABLE_PREFIX') || '';
   return `${prefix}${base}`;
 }
 

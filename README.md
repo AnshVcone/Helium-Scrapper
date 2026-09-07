@@ -287,6 +287,59 @@ is re-queued on startup — that is finishing the original work, not retrying
 failures. The ledger means the resumed run only pays for ASINs that had not
 settled.
 
+## Dev or staging: which database a run writes to
+
+`SCRAPER_MODE` picks the target. **The default is `dev`**, deliberately — an
+unconfigured box must not write to the shared staging tables because someone
+forgot a variable.
+
+```bash
+SCRAPER_MODE=dev      npm run dbcheck   # trainee DB, for rehearsals
+SCRAPER_MODE=staging  npm run dbcheck   # the shared DB the Go sync also writes
+```
+
+| Mode | Resolves from | Falls back to unprefixed `DB_*`? |
+|---|---|---|
+| `dev` | `DEV_DB_*` | **No — an error instead** |
+| `staging` | `STAGING_DB_*` | Yes, so an older `.env` keeps working |
+
+**That asymmetry is the whole point.** The legacy unprefixed variables point at
+staging, so letting dev mode fall back to them would write a "dev test run"
+straight into the shared tables — the exact accident the switch exists to
+prevent. In dev mode a missing `DEV_DB_HOST` stops the process with an
+explanation.
+
+The mode is visible everywhere you might check it: `npm run dbcheck` prints the
+resolved target rather than the raw variables, `getPool()` logs it on first
+connect, the server banner prints it at boot, and `GET /health` returns it.
+
+```json
+{ "ok": true, "mode": "dev", "db": "azaffiliates_office_server_trainee",
+  "host": "134.195.138.82", "tablePrefix": "dev_az_", "activeJob": null }
+```
+
+### A fresh dev database has no tables
+
+`npm run dbcheck` reports both as `MISSING TABLE`. The scraper writes only 11 of
+the 74 columns in the found table, but the rest still have to exist — the upsert
+names them, and a rehearsal is only a rehearsal if the target matches the real
+thing. `pg_dump` is not required:
+
+```bash
+node scripts/init-dev-tables.mjs           # print the DDL, change nothing
+node scripts/init-dev-tables.mjs --apply   # create them in dev
+```
+
+It reads staging's catalog (exact types via `format_type()`, constraints via
+`pg_get_constraintdef()`, indexes via `pg_indexes.indexdef`), rewrites the prefix
+if it differs, and creates each table and its indexes in **one transaction** —
+a table without its unique index would silently turn every upsert into an
+insert. It only ever writes to the dev target, and refuses to run if both modes
+resolve to the same host and database.
+
+**Verified end to end:** a row written through `writeMissing()` in dev mode
+appeared in the trainee database and **not** in staging.
+
 ## The scraper only runs what you upload
 
 **A job's ASIN list comes from your CSV and nowhere else.** There are exactly two
