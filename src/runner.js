@@ -4,6 +4,7 @@ import { extractPanel, Status } from './extract.js';
 import { login, isLoggedIn, touchSession, getCreds, explain, Auth } from './auth.js';
 import { checkPanelVersion } from './browser.js';
 import { writeFound, writeMissing, MissingReason, NoDataCode, existingKeys } from './db.js';
+import { browseLikeAHuman, shouldTakeLongBreak, scheduleNextBreak } from './behave.js';
 import { Event } from './notify.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -155,6 +156,9 @@ export async function runJob({
   // Last time helium10.com was requested. Starts now: the session was just
   // established, so it does not need touching on the first ASIN.
   let lastTouch = Date.now();
+  // First long break lands after a random number of ASINs, so two servers
+  // started together do not pause in lockstep.
+  let nextBreakAt = scheduleNextBreak(0, config.longBreakEvery);
   let versionChecked = false;
   // Once a panel has rendered in this run, the extension is demonstrably
   // installed and working.
@@ -413,7 +417,36 @@ export async function runJob({
         }
       }
 
-      if (i < queue.length - 1) await sleep(rand(config.delayMs));
+      if (i < queue.length - 1) {
+        // The inter-ASIN gap, spent on the page rather than on a frozen one.
+        // Same duration either way -- this is not a slowdown, it is the same
+        // wait with scrolling and cursor movement in it instead of nothing.
+        //
+        // Deliberately after the row is recorded: the extractor waits for the
+        // panel's figures to stop changing, and scrolling inside that window
+        // would risk a wrong reading for the sake of looking busy.
+        const gap = rand(config.delayMs);
+        if (config.humanize) await browseLikeAHuman(page, gap);
+        else await sleep(gap);
+
+        // Occasional longer pause, so the traffic is not a metronome.
+        if (
+          config.longBreakEvery[0] > 0 &&
+          shouldTakeLongBreak(summary.processed, nextBreakAt)
+        ) {
+          const restMs = rand(config.longBreakMs);
+          nextBreakAt = scheduleNextBreak(summary.processed, config.longBreakEvery);
+          summary.longBreaks = (summary.longBreaks || 0) + 1;
+          console.log(
+            `[runner] pausing ${Math.round(restMs / 1000)}s after ${summary.processed} ` +
+            `ASINs (next break at ~${nextBreakAt})`,
+          );
+          // Honour a stop request during the break rather than making someone
+          // wait out five minutes of nothing.
+          const until = Date.now() + restMs;
+          while (Date.now() < until && !shouldStop()) await sleep(1000);
+        }
+      }
     }
 
     await flush();

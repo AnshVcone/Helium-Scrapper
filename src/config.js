@@ -81,6 +81,30 @@ export const config = {
   // Left in, at 0, because the measurement is worth keeping and because an idle
   // timeout is still not ruled out -- only this way of preventing it is.
   keepAliveMs: Number(process.env.SESSION_KEEPALIVE_MS || 0),
+
+  // Behave like a reader on the page instead of sleeping on a frozen one.
+  //
+  // Free: it spends the delayMs gap that was already being spent, and adds no
+  // requests. That last part is the constraint -- Amazon throttled us after
+  // ~443 product loads, so anything that visits *more* pages (arriving via
+  // search, opening the reviews page) trades a block for a bit of realism.
+  humanize: process.env.HUMANIZE !== '0',
+
+  // Occasional longer pauses. A uniform 4-9s gap forever is random per gap and
+  // perfectly regular in aggregate; hours without a break is not what a
+  // person's traffic looks like. It also lets a squeezed IP recover, which on
+  // today's evidence matters more than the realism.
+  //
+  // Set longBreakEvery to 0 to disable. Costs roughly 3 minutes per 60 ASINs,
+  // about a 15% slowdown, in exchange for a much less mechanical shape.
+  longBreakEvery: [
+    Number(process.env.LONG_BREAK_EVERY_MIN || 45),
+    Number(process.env.LONG_BREAK_EVERY_MAX || 90),
+  ],
+  longBreakMs: [
+    Number(process.env.LONG_BREAK_MS_MIN || 90000),
+    Number(process.env.LONG_BREAK_MS_MAX || 300000),
+  ],
 };
 
 export const rand = ([lo, hi]) => lo + Math.floor(Math.random() * (hi - lo));

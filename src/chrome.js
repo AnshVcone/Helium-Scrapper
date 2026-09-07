@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
 import { config } from './config.js';
+import { pickViewport } from './behave.js';
 
 // Why Chromium and not Chrome:
 //
@@ -39,10 +40,14 @@ export async function openBrowser({ headless = process.env.HEADLESS === '1' } = 
   // is translated below. It happens for real -- `npm run login` holds the
   // profile while it waits for a CAPTCHA, and a job starting in that window
   // (including one `restore()` re-queued on boot) dies on the lock.
+  // A real desktop viewport, varied per launch. `viewport: null` inherits the
+  // window size, which headless defaults to 800x600 -- an unusual size, and
+  // identical on every page load of every run.
+  const vp = pickViewport();
   const ctx = await launchOrExplain({
     channel: 'chromium',
     headless,
-    viewport: null,
+    viewport: vp,
     args: [
       `--disable-extensions-except=${ext.dir}`,
       `--load-extension=${ext.dir}`,
@@ -60,7 +65,7 @@ export async function openBrowser({ headless = process.env.HEADLESS === '1' } = 
   // (see launchOrExplain below for why the launch is wrapped)
   await ctx.waitForEvent('serviceworker', { timeout: 15000 }).catch(() => {});
 
-  return { ctx, extensionVersion: ext.version };
+  return { ctx, extensionVersion: ext.version, viewport: vp };
 }
 
 // Translate the one launch failure that has a human cause into a message that

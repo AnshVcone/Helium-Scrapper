@@ -149,6 +149,47 @@ footer, and mismatches warn loudly.
   describe the whole variation family, not that child. Resolve the grain before
   loading anywhere.
 
+## Looking like a reader, not a script
+
+The scraper spends its inter-ASIN gap **on the page** — irregular scrolls with
+easing and jitter, occasional scrolls back up, curved mouse paths, plain dwell —
+instead of sleeping on a frozen one. Viewport is a real desktop size, varied per
+launch, rather than the headless 800x600 default that was identical on every
+load. Occasional multi-minute breaks (`LONG_BREAK_*`) break up a gap
+distribution that was otherwise regular for hours.
+
+**It costs nothing.** The 4–9s gap was already being spent; measured, a 7,000ms
+budget takes 7,003ms. Set `HUMANIZE=0` to disable.
+
+### What is deliberately NOT done, and why
+
+Arriving via a search results page, or opening the reviews page and coming back,
+are the obvious "human" touches. They are **the wrong trade here**, because they
+each *double the requests per ASIN* — and requests are the binding constraint,
+not realism. Amazon throttled this scraper after ~443 product loads from one IP,
+with the TIMEOUT rate climbing 1% → 2% → 7% → 14% → 100%. Those techniques would
+look more human right up until they got blocked twice as fast.
+
+So every technique here adds **time on page and zero extra requests**, which
+lowers the request rate and looks human at the same time. The strongest remaining
+signal is unaddressed and known: every navigation is a bare `/dp/{asin}` hit with
+no referrer and no navigation graph. Fixing that means more requests, so it stays
+on the list rather than in the code.
+
+Also deliberately absent: fingerprint spoofing and `navigator.webdriver`
+patching. Those were ruled out on 2026-08-27; this is pacing, not evasion.
+
+### Ordering, which matters for correctness
+
+Behaviour runs **after** the row is recorded, never during extraction. The
+extractor waits for the panel's figures to stop changing, and scrolling inside
+that window would risk a wrong reading for the sake of looking busy.
+
+**Verified:** the panel launcher is found at all six viewports (it is located by
+geometry, `r.right > window.innerWidth - 140`, so a wider window could have
+broken it), and a 7s behaviour budget moved the page through 5 distinct scroll
+positions from 0 to 1714px.
+
 ## Pacing
 
 `config.delayMs` is 4–9s of jitter between ASINs. Page load plus the
