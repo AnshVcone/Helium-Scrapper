@@ -69,7 +69,29 @@ systemctl enable h10-scraper
 
 echo
 echo "Done. Next:"
-echo "  1. Put credentials + DB settings in $APP_DIR/.env  (chmod 600)"
-echo "  2. systemctl start h10-scraper"
-echo "  3. sudo -u $APP_USER bash -lc 'cd $APP_DIR && npm run dbcheck && npm run auth'"
-echo "  4. journalctl -u h10-scraper -f"
+echo "  1. Put credentials + DB settings in $APP_DIR/.env  (chmod 600)."
+echo "     Start with SCRAPER_MODE=dev so a first sweep cannot touch staging."
+echo "     Both DB hosts must whitelist this VM's egress IP (firewall + pg_hba)."
+echo
+echo "  2. Give it a Helium 10 session. There is no display here, so it cannot"
+echo "     solve the reCAPTCHA -- copy one in from a machine that can:"
+echo "        on your laptop:  npm run login && npm run profile:save"
+echo "        scp profile-seed.tar.gz $APP_DIR/"
+echo "        here:            sudo -u $APP_USER bash -lc 'cd $APP_DIR && npm run profile:load'"
+echo "     (\`npm run auth\` will NOT sign in -- it refuses to submit the login"
+echo "      form without --submit, because a submission that meets a CAPTCHA"
+echo "      revokes the session the seed just installed.)"
+echo
+echo "  3. Verify, in this order:"
+echo "        npm run dbcheck      # prints the RESOLVED target for SCRAPER_MODE"
+echo "        npm run session      # read-only; must say LIVE"
+echo "        npm run notifycheck  # proves Cliq alerts reach the channel from here"
+echo "        npm run probe B0BCJFJV4W   # proves the panel parses from this IP"
+echo
+echo "  4. systemctl start h10-scraper && journalctl -u h10-scraper -f"
+echo "     The UI binds 127.0.0.1 only. Reach it with:"
+echo "        ssh -L 8090:localhost:8090 <user>@<this-vm>"
+echo
+echo "  5. First real sweep: upload a SMALL sheet and watch the TIMEOUT rate."
+echo "     Under ~5% is a healthy IP; climbing past ~15% means Amazon is"
+echo "     squeezing it -- stop and rest it rather than burning the sheet."

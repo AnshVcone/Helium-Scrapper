@@ -13,6 +13,10 @@ WorkingDirectory=__APP_DIR__
 # .env itself, so there is one parser and one behaviour everywhere.
 Environment=NODE_ENV=production
 Environment=HEADLESS=1
+# Loopback only. The service has no authentication and every useful endpoint
+# writes, so it must not be reachable from outside the box; use an SSH tunnel.
+# .env can override this, but do not, unless a firewall restricts the port.
+Environment=BIND_HOST=127.0.0.1
 ExecStart=/usr/bin/node src/server.js
 
 # A crash mid-scrape is expected occasionally (Chromium dying, network blips).
