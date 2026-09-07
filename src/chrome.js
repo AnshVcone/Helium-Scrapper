@@ -28,7 +28,21 @@ export function pinned() {
   return { version, dir: abs };
 }
 
-export async function openBrowser({ headless = process.env.HEADLESS === '1' } = {}) {
+// Headless unless something explicitly asks otherwise.
+//
+// This used to default to `HEADLESS === '1'`, i.e. HEADED unless told. That is
+// backwards for the environment this actually runs in: a server has no X
+// server, so headed is not slower there, it exits immediately with "Missing X
+// server or $DISPLAY". It failed on the VM precisely that way, and only because
+// probe.js never loaded .env -- so HEADLESS=1 sat in the file, unread.
+//
+// Defaulting to headless makes that class of mistake harmless: the only thing
+// that needs a window is the interactive sign-in, and it asks for one.
+function defaultHeadless() {
+  return process.env.HEADLESS !== '0';
+}
+
+export async function openBrowser({ headless = defaultHeadless() } = {}) {
   const ext = pinned();
 
   // Extensions only load in a persistent context -- there is no way to attach

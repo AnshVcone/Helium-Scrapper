@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { openBrowser, getPage } from './chrome.js';
+import { loadEnv } from './db.js';
 import { checkPanelVersion } from './browser.js';
 import { config } from './config.js';
 import { extractPanel } from './extract.js';
@@ -9,6 +10,11 @@ import { extractPanel } from './extract.js';
 // actually renders, so the extractor is checked against real markup rather than
 // assumed markup.
 const asin = process.argv[2] || 'B0BCJFJV4W';
+
+// Without this, nothing in .env is visible here -- which is how HEADLESS=1 went
+// unread on the VM and the launch tried to open a window on a box with no X
+// server.
+loadEnv();
 
 const { ctx } = await openBrowser();
 const page = await getPage(ctx);
