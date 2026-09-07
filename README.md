@@ -632,12 +632,29 @@ cannot.** Solving it is deliberately out of scope. On a laptop that is a one-off
 annoyance; on a headless VM it is a wall, because there is no screen to click.
 
 ```bash
-npm run login          # opens a real window, credentials pre-filled, and WAITS
+npm run login          # tries automatically first; only asks you if challenged
 ```
 
-Unlike `npm run auth` — which reports `CAPTCHA` and exits, closing the window
-before you can touch it — this one polls for up to `LOGIN_WAIT_MINUTES` (10)
-while you solve the challenge, then closes itself once the session is live.
+It attempts the automated sign-in **headless, with no window**. If Helium 10 is
+not serving a challenge, that is the end of it — no human involved. Only when the
+response is an actual CAPTCHA or 2FA does it open a window, pre-fill the
+credentials, and poll for up to `LOGIN_WAIT_MINUTES` (10) while you solve it.
+
+It used to go straight to the window-and-wait, which was right when every
+attempt was challenged and wrong once they were not: it sat waiting for someone
+who had nothing to do. Attempting first is safe because a submission that meets
+a CAPTCHA revokes the *existing* session, and there is none to lose at that
+point — `isLoggedIn()` has already said so.
+
+**Verified 2026-09-07:** cookies cleared to simulate a lost session, then
+`npm run login` reported `result: OK` and a working panel with no window and no
+input. The same `login()` call is what the runner uses to recover mid-sweep, so
+while Helium 10 is not challenging, **a run that loses its session now
+re-authenticates itself instead of aborting** — the single biggest cause of short
+runs.
+
+`npm run auth` is still not the way to sign in: it refuses to submit without
+`--submit`, because using it as a "check" destroyed two good sessions.
 
 ### The session is portable
 
